@@ -206,6 +206,52 @@ omit: sync pull
         self.assertIn("not on the map: export", loud.stdout)
 
 
+SHOP = ROOT / "examples" / "shop-stack.json"
+
+
+class Stack(unittest.TestCase):
+    def model(self):
+        return fm.read_compose(SHOP.read_text())
+
+    def test_ports_read_as_their_defaults_and_secrets_are_never_resolved(self):
+        m = self.model()
+        self.assertEqual(m["services"]["db"]["ports"], ["3306 \u2192 3306"])
+        self.assertEqual(fm.plain("${DB_PASSWORD}"), "$DB_PASSWORD")
+        self.assertNotIn("DB_PASSWORD", fm.stack_svg(m, "T", "", "a test", "")[0].replace("$DB_PASSWORD", ""))
+
+    def test_columns_follow_the_request_path_and_data_goes_last(self):
+        m = self.model()
+        main = [n for n, s in m["services"].items() if not s["profiles"]]
+        cols, sinks = fm.stack_columns(main, m["services"])
+        self.assertEqual(cols[0], ["proxy"])
+        self.assertEqual(sorted(sinks), ["db", "queue", "search"])
+        column_of = {n: i for i, c in enumerate(cols) for n in c}
+        self.assertEqual(column_of["web"], column_of["app"], "a service sharing a volume sits with its mate")
+
+    def test_three_arrows_into_the_data_become_one_into_its_bus(self):
+        svg, _, _ = fm.stack_svg(self.model(), "T", "", "a test", "")
+        self.assertEqual(svg.count('stroke-width="3" stroke-linecap="round"'), 1, "one bus for the data column")
+
+    def test_profiles_become_dashed_boxes(self):
+        svg, _, _ = fm.stack_svg(self.model(), "T", "", "a test", "")
+        self.assertIn("OPT-IN PROFILE: JOBS", svg)
+        self.assertIn("OPT-IN PROFILE: MAIL", svg)
+
+    def test_no_two_cards_overlap(self):
+        m = self.model()
+        svg, _, _ = fm.stack_svg(m, "T", "", "a test", "")
+        cards = [tuple(map(float, r)) for r in re.findall(r'<rect x="([\d.]+)" y="([\d.]+)" width="250" height="([\d.]+)"', svg)]
+        boxes = [{"x": x, "y": y, "w": 250, "h": h} for x, y, h in cards]
+        self.assertEqual(len(boxes), len(m["services"]))
+        for i, a in enumerate(boxes):
+            for b in boxes[i + 1:]:
+                self.assertFalse(overlaps(a, b))
+
+    def test_an_empty_configuration_is_refused(self):
+        with self.assertRaises(fm.SpecError):
+            fm.read_compose('{"services": {}}')
+
+
 class Drawing(unittest.TestCase):
     def test_svg_escapes_what_it_draws(self):
         s = spec_from(OUTLINE.replace("open a file", "open <b>&</b> a file"))

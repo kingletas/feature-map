@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.0 (2026-09-26)
+
+- **`stack` draws a Docker Compose stack**, experimental. It reads `docker compose config --format json`, so it needs no YAML library and runs nothing. Boxes are networks when there is more than one, and Compose profiles otherwise. Services run left to right along the request path, with the data stores in the last column behind one shared connector, ports and volumes as small tags, and a dot for a health check. No line passes behind a card.
+
 ## 0.2.0 (2026-09-26)
 
 - **`draft` writes an outline from a tool's own help text or Makefile**, grouped under the help's own headings, for a person to curate. It reads a file or standard input and never runs a command.

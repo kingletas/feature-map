@@ -15,6 +15,7 @@ Usage:
     feature-map check SPEC          validate the outline and print what it holds
     feature-map draft help|make SOURCE --title T    draft an outline from help text or a Makefile
     feature-map drift SPEC help|make SOURCE         what the tool has that the map does not show
+    feature-map stack COMPOSE_JSON [-o OUT]         draw a Docker Compose stack (experimental)
     feature-map --version
 
 SPEC is a Markdown outline (see docs/format.md) or the same thing as JSON.
@@ -42,7 +43,7 @@ import tempfile
 import textwrap
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 PALETTE = ["#2563eb", "#16a34a", "#d97706", "#7c3aed", "#0d9488", "#db2777", "#4f46e5", "#ca8a04"]
 PLANNED = "#b91c1c"
@@ -345,6 +346,26 @@ def mermaid(spec):
 
 # --- png ---------------------------------------------------------------------
 
+def write_output(body, width, height, title, output):
+    """svg, html or png, by the output's extension; svg to stdout without one."""
+    fmt = Path(output).suffix.lstrip(".") if output else "svg"
+    html_page = (f'<!doctype html><html><head><meta charset="utf-8"><title>{esc(title)}</title>'
+                 f'<link rel="stylesheet" href="{FONTS}"></head><body style="margin:0;background:#f7f5ef">{body}</body></html>\n')
+    if fmt == "png":
+        try:
+            screenshot(html_page, width, height, output)
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            print(f"feature-map: {exc}", file=sys.stderr)
+            return 3
+        return 0
+    text = html_page if fmt == "html" else body
+    if output:
+        Path(output).write_text(text, encoding="utf-8")
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
 def browser():
     found = os.environ.get("FEATURE_MAP_BROWSER")
     for name in ([found] if found else []) + ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"]:
@@ -354,21 +375,25 @@ def browser():
     return None
 
 
-def png(spec, out):
+def screenshot(html_page, width, height, out):
     exe = browser()
     if not exe:
         raise RuntimeError("png needs a Chromium-based browser on PATH, or FEATURE_MAP_BROWSER set")
-    geo = layout(spec)
     out = Path(out).resolve()
     # Written beside the output, not in /tmp: a sandboxed browser may not see /tmp.
     with tempfile.TemporaryDirectory(dir=out.parent, prefix=".feature-map-") as tmp:
         src = Path(tmp) / "map.html"
-        src.write_text(page(spec), encoding="utf-8")
+        src.write_text(html_page, encoding="utf-8")
         cmd = [exe, "--headless=new", "--disable-gpu", "--hide-scrollbars", "--virtual-time-budget=8000",
-               f"--window-size={geo['width']},{geo['height']}", f"--screenshot={out}", src.as_uri()]
+               f"--window-size={width},{height}", f"--screenshot={out}", src.as_uri()]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
     if result.returncode != 0 or not out.exists():
         raise RuntimeError(f"the browser did not write {out.name}: {result.stderr.strip()[-300:]}")
+
+
+def png(spec, out):
+    geo = layout(spec)
+    screenshot(page(spec), geo["width"], geo["height"], out)
 
 
 # --- reading a tool's own description: draft and drift ------------------------
@@ -493,6 +518,279 @@ def drift(spec, groups):
     return missing, stale
 
 
+# --- stack: a Compose file drawn as boxes and paths -------------------------
+
+VAR_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?::?-([^}]*))?\}")
+
+
+def plain(text):
+    """'${HTTP_PORT:-8080}' reads as its default, '8080'; a variable with no
+    default stays a variable name, since the real value is not ours to show."""
+    return VAR_RE.sub(lambda m: m.group(1) if m.group(1) is not None else "$" + m.group(0)[2:-1].split(":")[0], str(text))
+
+
+def port_label(p):
+    if isinstance(p, dict):
+        pub, target = p.get("published"), p.get("target")
+        return f"{plain(pub)} \u2192 {target}" if pub else str(target)
+    parts = plain(p).rsplit(":", 2)
+    return f"{parts[-2]} \u2192 {parts[-1]}" if len(parts) >= 2 else parts[-1]
+
+
+def image_label(svc):
+    if svc.get("build") and not svc.get("image"):
+        return "built here"
+    img = plain(svc.get("image", "built here"))
+    name = img.split("/")[-1]
+    return name if len(name) <= 30 else name[:29] + "\u2026"
+
+
+def read_compose(text):
+    """Docker Compose's resolved form, as `docker compose config --format json`
+    prints it. JSON only: no YAML parser is needed, and the tool runs nothing."""
+    c = json.loads(text)
+    services = c.get("services") or {}
+    if not services:
+        raise SpecError("no services in that Compose configuration")
+    out = {}
+    for name, svc in services.items():
+        nets = svc.get("networks")
+        nets = list(nets.keys()) if isinstance(nets, dict) else (nets or ["default"])
+        vols = []
+        for v in svc.get("volumes") or []:
+            if isinstance(v, dict) and v.get("type") == "volume" and v.get("source"):
+                vols.append(v["source"])
+        deps = svc.get("depends_on") or {}
+        out[name] = {
+            "image": image_label(svc),
+            "networks": nets,
+            "ports": [port_label(p) for p in svc.get("ports") or []],
+            "volumes": vols,
+            "depends": list(deps.keys()) if isinstance(deps, dict) else list(deps),
+            "health": "healthcheck" in svc and not (svc["healthcheck"] or {}).get("disable"),
+            "profiles": svc.get("profiles") or [],
+        }
+    nets = {k: bool((v or {}).get("external")) for k, v in (c.get("networks") or {}).items()}
+    return {"name": c.get("name", ""), "services": out, "networks": nets}
+
+
+def stack_columns(names, svcs):
+    """Left to right along the request path, returned with the data column.
+
+    The entry is what publishes a port and depends on something; the services
+    it reaches follow its paths. The last column holds the data stores: what is
+    depended on, depends on nothing, and is used by a service that needs several
+    things at once. A service off the path sits with a service it shares a
+    volume with, since a shared socket or code volume puts two containers in
+    the same tier."""
+    depended = {d for n in names for d in svcs[n]["depends"] if d in names}
+    entries = [n for n in names if svcs[n]["ports"] and svcs[n]["depends"] and n not in depended]
+    depth = {n: 0 for n in entries}
+    frontier = list(entries)
+    while frontier:
+        nxt = []
+        for n in frontier:
+            for d in svcs[n]["depends"]:
+                if d in names and depth.get(d, -1) < depth[n] + 1:
+                    depth[d] = depth[n] + 1
+                    nxt.append(d)
+        frontier = nxt
+    # A data store is depended on, depends on nothing, and is used by at least
+    # one service that needs several things at once. A single next hop, like
+    # the web server behind a cache, stays on the path even though nothing
+    # comes after it.
+    sinks = [n for n in names if n in depended and not [d for d in svcs[n]["depends"] if d in names]
+             and any(n in svcs[m]["depends"] and len([d for d in svcs[m]["depends"] if d in names]) >= 2 for m in names)]
+    for n in sinks:
+        depth.pop(n, None)
+    for n in names:
+        if n in depth or n in sinks:
+            continue
+        mates = [m for m in depth if set(svcs[m]["volumes"]) & set(svcs[n]["volumes"])]
+        depth[n] = max((depth[m] for m in mates), default=max(depth.values(), default=-1) + 1)
+    cols = {}
+    for n in names:
+        if n not in sinks:
+            cols.setdefault(depth[n], []).append(n)
+    ordered = [cols[k] for k in sorted(cols)]
+    return ordered, sinks
+
+
+CARD_W, CARD_GAP, COL_GAP = 250, 18, 110
+
+
+def card_height(svc):
+    return 58 + (22 if svc["ports"] else 0) + (22 if svc["volumes"] else 0)
+
+
+def stack_svg(model, title, subtitle, source, date):
+    svcs = model["services"]
+    multi_net = len([n for n in model["networks"] if n]) > 1
+    if multi_net:
+        boxes = [(f"network: {n}", [s for s in svcs if svcs[s]["networks"][0] == n], model["networks"][n]) for n in model["networks"]]
+    else:
+        boxes = [("always running", [s for s in svcs if not svcs[s]["profiles"]], False)]
+        for prof in sorted({p for s in svcs.values() for p in s["profiles"]}):
+            boxes.append((f"opt-in profile: {prof}", [s for s in svcs if svcs[s]["profiles"] and svcs[s]["profiles"][0] == prof], True))
+    boxes = [b for b in boxes if b[1]]
+
+    pos, frames, buses = {}, [], []
+    y = TOP - 40
+    main_w = 0
+    row_x, row_h = 60, 0
+    for bi, (label, names, dashed) in enumerate(boxes):
+        if bi == 0 or multi_net:
+            cols, sinks = stack_columns(names, svcs)
+            if sinks:
+                cols = cols + [sinks]
+        else:
+            per = min(4, len(names))
+            cols, sinks = [names[i::per] for i in range(per)], []
+        heights = [sum(card_height(svcs[n]) + CARD_GAP for n in col) - CARD_GAP for col in cols]
+        bw = len(cols) * CARD_W + (len(cols) - 1) * COL_GAP + 80
+        bh = max(heights) + 90
+        if bi == 0 or multi_net:
+            bx, by = 60, y
+            y += bh + 50
+        else:
+            # Opt-in boxes flow in a row under the main box, wrapping when full.
+            if row_x + bw > max(main_w, 1500) + 60 and row_x > 60:
+                row_x, y = 60, y + row_h + 40
+                row_h = 0
+            bx, by = row_x, y
+            row_x += bw + 40
+            row_h = max(row_h, bh)
+        main_w = max(main_w, bx - 60 + bw)
+        frames.append((bx, by, bw, bh, label, dashed))
+        for ci, col in enumerate(cols):
+            # The main path is centred so it reads as one line; opt-in boxes
+            # are top-aligned, since they are lists rather than a path.
+            centred = bi == 0 or multi_net
+            cy = by + 60 + ((max(heights) - heights[ci]) / 2 if centred else 0)
+            for n in col:
+                h = card_height(svcs[n])
+                pos[n] = (bx + 40 + ci * (CARD_W + COL_GAP), cy, CARD_W, h, dashed)
+                cy += h + CARD_GAP
+        if sinks:
+            first = pos[sinks[0]]
+            last = pos[sinks[-1]]
+            buses.append((set(sinks), first[0] - 34, first[1], last[1] + last[3]))
+    y += row_h + (50 if row_h else 0)
+    W = int(max(1800, main_w + 120))
+    H = int(y + 80)
+
+    def anchor(n, side):
+        x, yy, w, h, _ = pos[n]
+        return (x + w, yy + h / 2) if side == "r" else (x, yy + h / 2)
+
+    def curve(x1, y1, x2, y2):
+        mid = (x1 + x2) / 2
+        return (f'<path d="M{x1:.1f},{y1:.1f} C{mid:.1f},{y1:.1f} {mid:.1f},{y2:.1f} {x2 - 6:.1f},{y2:.1f}" '
+                'stroke="#475569" stroke-width="1.8" fill="none" opacity=".75" marker-end="url(#arr)"/>')
+
+    main_bottom = frames[0][1] + frames[0][3] if frames else 0
+
+    def route(points):
+        d = "M" + " L".join(f"{x:.1f},{y:.1f}" for x, y in points)
+        return (f'<path d="{d}" stroke="#475569" stroke-width="1.8" fill="none" opacity=".75" '
+                'stroke-linejoin="round" marker-end="url(#arr)"/>')
+
+    def climb(n, x2, y2, up_into=False):
+        """An edge from a box below the main one never passes behind a card:
+        it rises to the gap under the main box, runs along it, climbs the gutter
+        beside the target's column, and turns into the target."""
+        x, yy, w, _, _ = pos[n]
+        lane = main_bottom + 22
+        # Leave from the right of the card, clear of its box's label above it.
+        x1 = x + w - 40
+        if up_into:
+            return route([(x1, yy), (x1, lane), (x2, lane), (x2, y2 + 6)])
+        gutter = x2 - COL_GAP / 2
+        return route([(x1, yy), (x1, lane), (gutter, lane), (gutter, y2), (x2 - 6, y2)])
+
+    def below(n, d):
+        return pos[n][1] > pos[d][1] + pos[d][3] + 40
+
+    edges = []
+    for members, bus_x, top, bottom in buses:
+        edges.append(f'<path d="M{bus_x:.1f},{top + 10:.1f} L{bus_x:.1f},{bottom - 10:.1f}" stroke="#475569" stroke-width="3" stroke-linecap="round" opacity=".55"/>')
+        for m in members:
+            _, yy, _, h, _ = pos[m]
+            edges.append(f'<path d="M{bus_x:.1f},{yy + h / 2:.1f} L{pos[m][0] - 6:.1f},{yy + h / 2:.1f}" stroke="#475569" stroke-width="1.8" opacity=".75" marker-end="url(#arr)"/>')
+    for n, svc in svcs.items():
+        if n not in pos:
+            continue
+        deps = [d for d in svc["depends"] if d in pos]
+        for members, bus_x, top, bottom in buses:
+            hit = [d for d in deps if d in members]
+            # Three or more arrows into the data column become one arrow into its bus.
+            if len(hit) >= 3:
+                x1, y1 = anchor(n, "r")
+                target_y = min(max(y1, top + 20), bottom - 20)
+                edges.append(climb(n, bus_x, bottom - 4, up_into=True) if pos[n][1] > bottom + 40 else curve(x1, y1, bus_x + 6, target_y))
+                deps = [d for d in deps if d not in members]
+        for d in deps:
+            if below(n, d):
+                x2, y2 = anchor(d, "l")
+                edges.append(climb(n, x2, y2))
+                continue
+            (x1, y1), (x2, y2) = anchor(n, "r"), anchor(d, "l")
+            if x2 < x1:
+                (x1, y1), (x2, y2) = anchor(n, "l"), anchor(d, "r")
+            edges.append(curve(x1, y1, x2, y2))
+    shared = {}
+    for n, svc in svcs.items():
+        for v in svc["volumes"]:
+            shared.setdefault(v, []).append(n)
+    vol_colors = {v: PALETTE[i % len(PALETTE)] for i, v in enumerate(sorted(v for v, u in shared.items() if len(u) > 1))}
+
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" role="img">',
+           f"<title>{esc(title)} stack</title>", f"<style>{STYLE}.cn{{font:700 16px 'Inter',system-ui,sans-serif;fill:#1f2937}}.ci{{font:500 12.5px 'Inter',system-ui,sans-serif;fill:#6b7280}}.tag{{font:600 12px 'Inter',system-ui,sans-serif}}.bl{{font:700 13px 'Inter',system-ui,sans-serif;letter-spacing:.08em}}</style>",
+           '<defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#475569"/></marker></defs>',
+           f'<rect width="{W}" height="{H}" fill="#f7f5ef"/>',
+           f'<text x="60" y="92" class="tt">{esc(title)}</text>',
+           f'<text x="62" y="130" class="st">{esc(subtitle)}</text>']
+    lx = W - 420
+    out.append(f'<g transform="translate({lx},48)">'
+               '<path d="M0,8 L34,8" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)"/><text x="46" y="13" class="lg">depends on</text>'
+               '<rect x="0" y="28" width="34" height="16" rx="4" fill="#7c3aed" fill-opacity=".16"/><text x="46" y="41" class="lg">same colour: a volume shared between services</text>'
+               '<rect x="0" y="56" width="34" height="18" rx="6" fill="none" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6 4"/><text x="46" y="70" class="lg">'
+               + ("external network" if multi_net else "runs only when its profile is asked for") + "</text>"
+               '<circle cx="17" cy="94" r="5" fill="#16a34a"/><text x="46" y="99" class="lg">has a health check</text></g>')
+    if not multi_net:
+        net = next(iter(model["networks"]), "default")
+        out.append(f'<text x="62" y="172" class="lede">One network ({esc(net)}), so the boxes are Compose profiles.</text>')
+    for bx, by, bw, bh, label, dashed in frames:
+        out.append(f'<rect x="{bx}" y="{by}" width="{bw}" height="{bh}" rx="22" fill="{"none" if dashed else "#ffffff"}" fill-opacity=".55" stroke="#94a3b8" stroke-width="1.6"{dash(dashed, "8 6")}/>')
+        out.append(f'<text x="{bx + 24}" y="{by + 32}" class="bl" fill="#64748b">{esc(label.upper())}</text>')
+    out += edges
+    for n, (x, yy, w, h, dashed) in pos.items():
+        svc = svcs[n]
+        out.append(f'<rect x="{x}" y="{yy:.1f}" width="{w}" height="{h}" rx="14" fill="#fff" stroke="{"#cbd5e1" if dashed else "#1f2a37"}" stroke-width="{1.4 if dashed else 1.8}"/>')
+        out.append(f'<text x="{x + 16}" y="{yy + 26:.1f}" class="cn">{esc(n)}</text>')
+        if svc["health"]:
+            out.append(f'<circle cx="{x + w - 18}" cy="{yy + 20:.1f}" r="5" fill="#16a34a"><title>health check</title></circle>')
+        out.append(f'<text x="{x + 16}" y="{yy + 46:.1f}" class="ci">{esc(svc["image"])}</text>')
+        ty = yy + 70
+        if svc["ports"]:
+            tx = x + 16
+            for p in svc["ports"][:3]:
+                tw = len(p) * 7.2 + 16
+                out.append(f'<rect x="{tx}" y="{ty - 14:.1f}" width="{tw:.1f}" height="19" rx="9.5" fill="#dbeafe"/><text x="{tx + 8}" y="{ty:.1f}" class="tag" fill="#1d4ed8">{esc(p)}</text>')
+                tx += tw + 6
+            ty += 22
+        if svc["volumes"]:
+            tx = x + 16
+            for v in svc["volumes"][:3]:
+                col = vol_colors.get(v, "#475569")
+                tw = len(v) * 7.2 + 16
+                out.append(f'<rect x="{tx}" y="{ty - 14:.1f}" width="{tw:.1f}" height="19" rx="4" fill="{col}" fill-opacity=".14"/><text x="{tx + 8}" y="{ty:.1f}" class="tag" fill="{col}">{esc(v)}</text>')
+                tx += tw + 6
+    footer = "DRAWN FROM " + source + (f"  \u00b7  {date}" if date else "")
+    out.append(f'<text x="{W / 2:.1f}" y="{H - 28}" text-anchor="middle" class="ft">{esc(footer.upper())}</text></svg>')
+    return "\n".join(out) + "\n", W, H
+
+
 # --- command line ------------------------------------------------------------
 
 def main(argv=None):
@@ -514,7 +812,28 @@ def main(argv=None):
     f.add_argument("spec")
     f.add_argument("kind", choices=["help", "make"])
     f.add_argument("source", help="a file, or - for standard input")
+    k = sub.add_parser("stack", help="draw a Docker Compose stack from `docker compose config --format json`")
+    k.add_argument("source", help="the JSON, a file or - for standard input")
+    k.add_argument("-o", "--output")
+    k.add_argument("--title")
+    k.add_argument("--subtitle", default="The services, and how they connect")
+    k.add_argument("--source-name", default="docker compose config")
+    k.add_argument("--date", default="")
     args = ap.parse_args(argv)
+
+    if args.cmd == "stack":
+        try:
+            text = sys.stdin.read() if args.source == "-" else Path(args.source).read_text(encoding="utf-8")
+            model = read_compose(text)
+        except (SpecError, json.JSONDecodeError) as exc:
+            print(f"feature-map: {args.source}: {exc}", file=sys.stderr)
+            return 1
+        except OSError as exc:
+            print(f"feature-map: {exc}", file=sys.stderr)
+            return 2
+        title = args.title or model["name"] or "Stack"
+        body, w, h = stack_svg(model, title, args.subtitle, args.source_name, args.date)
+        return write_output(body, w, h, title, args.output)
 
     if args.cmd == "draft":
         try:

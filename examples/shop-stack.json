@@ -1,0 +1,16 @@
+{
+  "name": "tinyshop",
+  "services": {
+    "proxy": {"image": "traefik:v3", "ports": [{"published": "8080", "target": 80}], "depends_on": {"cache": {}}, "healthcheck": {"test": ["CMD", "true"]}},
+    "cache": {"image": "varnish:7", "depends_on": {"app": {}}},
+    "app": {"build": {"context": "."}, "volumes": [{"type": "volume", "source": "sock"}], "depends_on": {"db": {}, "search": {}, "queue": {}}, "healthcheck": {"test": ["CMD", "true"]}},
+    "web": {"image": "nginx:1.27", "volumes": [{"type": "volume", "source": "sock"}]},
+    "db": {"image": "mariadb:11", "ports": ["${BIND:-127.0.0.1}:${DB_PORT:-3306}:3306"], "volumes": [{"type": "volume", "source": "db-data"}], "environment": {"MARIADB_ROOT_PASSWORD": "${DB_PASSWORD}"}},
+    "search": {"image": "opensearch:2"},
+    "queue": {"image": "rabbitmq:3"},
+    "worker": {"build": {"context": "."}, "profiles": ["jobs"], "depends_on": {"db": {}, "search": {}, "queue": {}, "app": {}}},
+    "mail": {"image": "mailpit:1", "profiles": ["mail"], "ports": ["8025:8025"]}
+  },
+  "networks": {"default": {}},
+  "volumes": {"sock": {}, "db-data": {}}
+}

@@ -52,6 +52,16 @@ mytool --help | feature-map drift mytool.md help -
 
 Details are in [docs/format.md](docs/format.md#drafting-from-a-tool-and-checking-a-map-against-it).
 
+## Draw a Compose stack (experimental)
+
+```bash
+docker compose config --no-interpolate --format json | feature-map stack - -o stack.png
+```
+
+draws the services and how they connect, in the same visual language as the feature map. `--no-interpolate` keeps secrets as `${VARIABLE}` placeholders, and the diagram shows a variable's name, never its value. [`examples/shop-stack.json`](examples/shop-stack.json) is an invented stack to try it on.
+
+It lays a stack out along its request path from what Compose declares: `depends_on`, profiles, networks, ports and named volumes. **It has been tried on a stack of about twenty services;** much larger ones may need grouping it does not do yet.
+
 ## Outputs
 
 | Format | For | Needs |
