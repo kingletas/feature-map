@@ -11,6 +11,8 @@
 - **Cards widen to fit their longest line**, and a network the drawing does not show is named on the cards that join it.
 - **The legend lists only what the drawing uses.**
 - `${VAR:?message}` reads as `$VAR`; it used to be printed whole.
+- **A next hop that ends a line is no longer taken for a data store.** A store is now used by a service that needs two or more ends of the line at once, so a debug web server behind the same proxy as a cache stays on the path beside it.
+- **The same stack draws the same SVG every run.** The data column's arrows used to follow a set's order, which changes from one process to the next.
 
 ## 0.3.0 (2026-09-26)
 

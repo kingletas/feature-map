@@ -653,7 +653,7 @@ def stack_columns(names, svcs):
     network another stack owns, and depends on something; the services it
     reaches follow its paths. The last column holds the data stores: what is
     depended on, depends on nothing, and is used by a service that needs several
-    things at once. A service off the path sits with a service it shares a
+    ends of the line at once. A service off the path sits with a service it shares a
     volume with, since a shared socket or code volume puts two containers in
     the same tier."""
     depended = {d for n in names for d in svcs[n]["depends"] if d in names}
@@ -668,12 +668,14 @@ def stack_columns(names, svcs):
                     depth[d] = depth[n] + 1
                     nxt.append(d)
         frontier = nxt
-    # A data store is depended on, depends on nothing, and is used by at least
-    # one service that needs several things at once. A single next hop, like
-    # the web server behind a cache, stays on the path even though nothing
-    # comes after it.
-    sinks = [n for n in names if n in depended and not [d for d in svcs[n]["depends"] if d in names]
-             and any(n in svcs[m]["depends"] and len([d for d in svcs[m]["depends"] if d in names]) >= 2 for m in names)]
+    # A data store is an end of the line (depended on, depending on nothing)
+    # used by a service that needs two or more ends of the line at once, as an
+    # application needs its database and its search. A proxy in front of a
+    # cache and a debug web server needs two things, but only one of them ends
+    # a line, so that server stays on the path as a next hop.
+    leaves = {n for n in names if n in depended and not [d for d in svcs[n]["depends"] if d in names]}
+    sinks = [n for n in names if n in leaves
+             and any(n in svcs[m]["depends"] and len([d for d in svcs[m]["depends"] if d in leaves]) >= 2 for m in names)]
     for n in sinks:
         depth.pop(n, None)
     for n in names:
@@ -863,7 +865,7 @@ def stack_svg(projects, title, subtitle, source, date):
         if sinks:
             first = pos[sinks[0]]
             last = pos[sinks[-1]]
-            buses.append((set(sinks), first[0] - 34, first[1], last[1] + last[3]))
+            buses.append((list(sinks), first[0] - 34, first[1], last[1] + last[3]))
     y += row_h + (50 if row_h else 0)
     W = int(max(1800, main_w + 120))
     H = int(y + 80)

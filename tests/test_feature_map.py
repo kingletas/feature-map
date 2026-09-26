@@ -228,9 +228,29 @@ class Stack(unittest.TestCase):
         column_of = {n: i for i, c in enumerate(cols) for n in c}
         self.assertEqual(column_of["web"], column_of["app"], "a service sharing a volume sits with its mate")
 
+    def test_a_next_hop_that_ends_a_line_is_not_a_data_store(self):
+        svcs = {
+            "gate": {"ports": ["80"], "depends": ["cache", "debug-web"], "volumes": []},
+            "cache": {"ports": [], "depends": ["web"], "volumes": []},
+            "web": {"ports": [], "depends": [], "volumes": []},
+            "debug-web": {"ports": [], "depends": [], "volumes": []},
+            "app": {"ports": [], "depends": ["db", "search"], "volumes": []},
+            "db": {"ports": [], "depends": [], "volumes": []},
+            "search": {"ports": [], "depends": [], "volumes": []},
+        }
+        cols, sinks = fm.stack_columns(list(svcs), svcs)
+        self.assertEqual(sorted(sinks), ["db", "search"])
+        column_of = {n: i for i, c in enumerate(cols) for n in c}
+        self.assertEqual(column_of["debug-web"], column_of["cache"], "a next hop sits beside the other next hop")
+
     def test_three_arrows_into_the_data_become_one_into_its_bus(self):
         svg, _, _ = fm.stack_svg(self.model(), "T", "", "a test", "")
         self.assertEqual(svg.count('stroke-width="3" stroke-linecap="round"'), 1, "one bus for the data column")
+
+    def test_the_same_stack_draws_the_same_svg_every_run(self):
+        runs = {subprocess.run([sys.executable, str(TOOL), "stack", str(SHOP)], capture_output=True, text=True,
+                               check=True, env={"PYTHONHASHSEED": seed}).stdout for seed in ("1", "2", "3")}
+        self.assertEqual(len(runs), 1)
 
     def test_profiles_become_dashed_boxes(self):
         svg, _, _ = fm.stack_svg(self.model(), "T", "", "a test", "")
