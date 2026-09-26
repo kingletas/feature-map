@@ -23,7 +23,7 @@ help: ## Show this help
 .PHONY: check
 check: test ## Compile, lint where available, and run the tests
 	@python3 -m py_compile $(FM)
-	@if command -v ruff >/dev/null; then ruff check bin tests; else echo "ruff not installed, lint skipped"; fi
+	@if command -v ruff >/dev/null; then ruff check bin/feature-map tests; else echo "ruff not installed, lint skipped"; fi
 
 .PHONY: test
 test: ## Run the tests, on invented outlines

@@ -18,7 +18,8 @@ Usage:
     feature-map stack [LABEL=]COMPOSE_JSON... [-o OUT]   draw a Docker Compose stack (experimental)
     feature-map --version
 
-SPEC is a Markdown outline (see docs/format.md) or the same thing as JSON.
+SPEC is a Markdown outline (see docs/format.md), the same thing as JSON, or -
+to read a Markdown outline from standard input.
 Without -o, svg and mermaid go to stdout. The format follows OUT's extension
 unless --format says otherwise. png needs a Chromium-based browser on PATH, or
 its path in FEATURE_MAP_BROWSER.
@@ -103,12 +104,16 @@ def parse_markdown(text):
             m = HEAD_RE.match(body)
             if m:
                 item = {"head": m.group(1), "text": m.group(2) or "", "planned": planned}
+            elif body.startswith("**"):
+                # Drawn as it stands, the asterisks would land in the picture.
+                raise SpecError(f"line {n}: a bold name is written '- **name**: what it does', not {body!r}")
             group["items"].append(item)
-        elif group is None and KEY_RE.match(line):
+        elif group is None and KEY_RE.match(line) and "://" not in line:
             key, value = KEY_RE.match(line).groups()
             if key not in SETTINGS:
-                raise SpecError(f"line {n}: {key + ':'!r} is not a setting; the settings are "
-                                + ", ".join(k + ":" for k in SETTINGS))
+                raise SpecError(f"line {n}: {key + ':'!r} is not a setting (the settings are "
+                                + ", ".join(k + ":" for k in SETTINGS)
+                                + "). If the line belongs to the paragraph, rewrap it so it does not start with 'word:'")
             spec[key.replace("-", "_")] = value.strip()
         elif group is None:
             spec["lede"].append(line.strip())
@@ -147,6 +152,9 @@ def normalise(spec):
         g.setdefault("planned", False)
         if not g.get("items"):
             raise SpecError(f"group {g.get('name')!r} has no items")
+        for i in g["items"]:
+            if not (isinstance(i, str) or (isinstance(i, dict) and all(isinstance(i.get(k, ""), str) for k in ("head", "text")))):
+                raise SpecError(f"group {g['name']!r}: an item is text, or an object with a text and an optional head")
         for it in g["items"]:
             if isinstance(it, str):
                 it = {"text": it}
@@ -169,6 +177,8 @@ def normalise(spec):
     spec.setdefault("date", "")
     spec.setdefault("planned_label", "not done yet")
     omit = spec.get("omit") or []
+    if not isinstance(omit, (str, list)) or (isinstance(omit, list) and not all(isinstance(o, str) for o in omit)):
+        raise SpecError("omit is a comma-separated line, or a list of names")
     spec["omit"] = [o.strip() for o in (omit.split(",") if isinstance(omit, str) else omit) if o.strip()]
     lede = spec.get("lede") or []
     spec["lede"] = textwrap.wrap(" ".join(lede), 52) if isinstance(lede, list) else textwrap.wrap(lede, 52)
@@ -213,9 +223,9 @@ def layout(spec):
     rows = math.ceil(len(bottom[0]["items"]) / 3) if bottom else 0
     # The planned row under the centre is a grid of three; its pitch comes from
     # its own widest and tallest pills, so long planned items never touch.
-    below = [pill_size(i) for i in bottom[0]["items"]] if bottom else []
-    col_pitch = max([300] + [w + 24 for w, _ in below])
-    row_pitch = max([78] + [h + 16 for _, h in below])
+    planned_sizes = [pill_size(i) for i in bottom[0]["items"]] if bottom else []
+    col_pitch = max([300] + [w + 24 for w, _ in planned_sizes])
+    row_pitch = max([78] + [h + 16 for _, h in planned_sizes])
     body = max(heights + [360])
     height = int(TOP + body + (140 + rows * row_pitch + 60 if bottom else 60) + 80)
     widest = max([pill_size(i)[0] for g in groups for i in g["items"]] + [200])
@@ -415,17 +425,19 @@ def browser():
     return None
 
 
-def screenshot(html_page, width, height, out):
+def screenshot(page_html, width, height, out):
     exe = browser()
     if not exe:
         raise RuntimeError("png needs a Chromium-based browser on PATH, or FEATURE_MAP_BROWSER set")
     out = Path(out).resolve()
+    if out.is_dir():
+        raise RuntimeError(f"{out} is a folder, not a file to write")
     # An old picture left from an earlier run must not pass for this one.
     out.unlink(missing_ok=True)
     # Written beside the output, not in /tmp: a sandboxed browser may not see /tmp.
     with tempfile.TemporaryDirectory(dir=out.parent, prefix=".feature-map-") as tmp:
         src = Path(tmp) / "map.html"
-        src.write_text(html_page, encoding="utf-8")
+        src.write_text(page_html, encoding="utf-8")
         cmd = [exe, "--headless=new", "--disable-gpu", "--hide-scrollbars", "--virtual-time-budget=8000",
                f"--window-size={width},{height}", f"--screenshot={out}", src.as_uri()]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
@@ -463,7 +475,7 @@ def read_help(text):
             # that are not commands, so everything under it is skipped.
             heading = line.lower()
             skipping = (heading.startswith(("usage", "flags", "exit", "environment", "example"))
-                        or "option" in heading or "optional argument" in heading)
+                        or bool(re.search(r"\boptions?\b|\boptional arguments\b", heading)))
             current = None if skipping else (line.strip().rstrip(":"), [])
             if current:
                 groups.append(current)
@@ -666,10 +678,19 @@ def read_compose(text, label=None):
             "mode": {"host": "host network", "none": "no network"}.get(mode, ""),
         }
     for name, other in modes.items():
-        # Sharing another container's network puts a service wherever that one is.
-        if other in out:
+        # Sharing another container's network puts a service wherever that one
+        # is, following a chain to its end. A container outside this file has a
+        # network the drawing cannot see, and the card says so.
+        seen = {name}
+        while other in modes and other not in seen:
+            seen.add(other)
+            other = modes[other]
+        if other in out and other not in modes:
             out[name]["networks"] = list(out[other]["networks"])
             out[name]["mode"] = out[other]["mode"]
+        else:
+            out[name]["networks"] = []
+            out[name]["mode"] = f"{modes[name]}'s network"
     return {"name": label or project, "services": out, "networks": nets}
 
 
@@ -689,7 +710,7 @@ def collapse(svcs):
         key = (n.split("-")[0], s["image"], tuple(s["networks"]), tuple(s["volumes"]), tuple(s["depends"]),
                tuple(s["after"]), s["health"], tuple(s["profiles"]))
         groups.setdefault(key, []).append(n)
-    def folded(names):
+    def folded_name(names):
         common = []
         for part in zip(*(m.split("-") for m in names)):
             if len(set(part)) > 1:
@@ -699,15 +720,15 @@ def collapse(svcs):
     candidates = [names for names in groups.values() if len(names) >= 3]
     counts = {}
     for names in candidates:
-        counts[folded(names)] = counts.get(folded(names), 0) + 1
+        counts[folded_name(names)] = counts.get(folded_name(names), 0) + 1
     # Two groups that would fold to one name are both drawn in full, so no
     # service ever disappears behind another group's card.
-    first = {names[0]: names for names in candidates if counts[folded(names)] == 1 and folded(names) not in svcs}
+    first = {names[0]: names for names in candidates if counts[folded_name(names)] == 1 and folded_name(names) not in svcs}
     dropped = {n for names in first.values() for n in names}
     out = {}
     for n, s in svcs.items():
         if n in first:
-            out[folded(first[n])] = dict(s, members=list(first[n]))
+            out[folded_name(first[n])] = dict(s, members=list(first[n]))
         elif n not in dropped:
             out[n] = s
     return out
@@ -824,17 +845,22 @@ def stack_svg(projects, title, subtitle, source, date):
     if isinstance(projects, dict):
         projects = [projects]
     multi = len(projects) > 1
-    folded = [collapse(p["services"]) for p in projects]
+    per_project = [collapse(p["services"]) for p in projects]
     seen = {}
-    for f in folded:
+    for f in per_project:
         for n in f:
             seen[n] = seen.get(n, 0) + 1
     svcs = {}
-    for pi, (p, f) in enumerate(zip(projects, folded)):
+    for pi, (p, f) in enumerate(zip(projects, per_project)):
         # Two projects may both have a db; Compose keeps them apart by project,
         # and so does the drawing, by naming each after its project.
         rename = {n: f"{p['name']}/{n}" for n in f if seen[n] > 1}
+        if rename and [q["name"] for q in projects].count(p["name"]) > 1:
+            raise SpecError(f"{', '.join(sorted(rename))} is in two projects with the same label "
+                            f"{p['name']!r}; give each project its own label, as LABEL=FILE")
         for n, s in f.items():
+            if rename.get(n, n) in svcs:
+                raise SpecError(f"{rename.get(n, n)} would be drawn twice; give each project its own label")
             svcs[rename.get(n, n)] = dict(s, project=pi, depends=[rename.get(d, d) for d in s["depends"]],
                                           after=[rename.get(d, d) for d in s["after"]])
 

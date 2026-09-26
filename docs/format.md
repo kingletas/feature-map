@@ -33,7 +33,7 @@ date: 1 March 2026
 | `planned-label: text` | The legend's wording for dashed items. Default `not done yet` |
 | `## Group` | A branch. Groups are coloured in order from a fixed palette |
 | `## Group [planned]` | A branch of work that is not done, or will not be. Drawn in red and dashed. The first one sits below the centre |
-| `- **name**: what it does` | A feature with a bold name and a short description. The colon matters: `- **Always** backs up` is plain text, not a name |
+| `- **name**: what it does` | A feature with a bold name and a short description. Any other use of `**` at the start of an item is refused, since the asterisks would be drawn as they are |
 | `- text` | A feature with a description only |
 | `- text [planned]` | One planned item inside a shipped group |
 

@@ -59,9 +59,26 @@ class Outline(unittest.TestCase):
         self.assertEqual(s["groups"][0]["items"][0], {"head": "open", "text": "open a file", "planned": False})
         self.assertEqual(s["groups"][1]["items"][1]["text"], "a plain item with no head")
 
-    def test_bold_text_without_a_colon_is_prose_not_a_name(self):
-        s = spec_from(OUTLINE.replace("- a plain item with no head", "- **Always** backs up first"))
-        self.assertNotIn("head", s["groups"][1]["items"][1])
+    def test_bold_that_is_not_a_name_is_refused_rather_than_drawn_with_its_asterisks(self):
+        for line in ("- **Always** backs up first", "- **sync:** push and pull", "- **search** : find notes"):
+            with self.assertRaisesRegex(fm.SpecError, "written", msg=line):
+                spec_from(OUTLINE.replace("- a plain item with no head", line))
+
+    def test_prose_that_starts_like_a_setting_is_refused_with_advice_and_a_url_is_not(self):
+        with self.assertRaisesRegex(fm.SpecError, "rewrap"):
+            spec_from(OUTLINE.replace("One line about it.", "It does three things, by\npriority: sync and search."))
+        s = spec_from(OUTLINE.replace("One line about it.", "https://example.com/manual covers it."))
+        self.assertIn("https://example.com/manual covers it.", " ".join(s["lede"]))
+
+    def test_json_items_of_the_wrong_type_are_refused_not_a_traceback(self):
+        base = {"title": "T", "source": "s", "groups": [{"name": "G", "items": ["a"]}]}
+        for bad in ({"items": [1]}, {"items": [{"head": 3, "text": "x"}]}):
+            spec = json.loads(json.dumps(base))
+            spec["groups"][0].update(bad)
+            with self.assertRaises(fm.SpecError, msg=bad):
+                fm.normalise(spec)
+        with self.assertRaises(fm.SpecError):
+            fm.normalise(dict(json.loads(json.dumps(base)), omit=5))
 
     def test_a_byte_order_mark_does_not_hide_the_title(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -169,6 +186,10 @@ lint:
 
 
 class Sources(unittest.TestCase):
+    def test_a_heading_that_only_contains_option_is_still_read(self):
+        names = [n for _, cmds in fm.read_help("Adoption workflow:\n  adopt   Take a site in\n") for n, _ in cmds]
+        self.assertEqual(names, ["adopt"])
+
     def test_options_and_examples_are_never_commands(self):
         text = ("Commands:\n  open FILE   Open it\n\nGlobal Options:\n  --config PATH   Where\n\n"
                 "optional arguments:\n  -h, --help   Help\n\nExamples:\n  tinytool open notes.txt\n\n"
@@ -261,6 +282,10 @@ class Stack(unittest.TestCase):
         m = self.model()
         self.assertEqual(m["services"]["db"]["ports"], ["3306 \u2192 3306"])
         self.assertEqual(fm.plain("${DB_PASSWORD}"), "$DB_PASSWORD")
+
+    def test_a_variable_with_no_default_is_drawn_only_as_its_name(self):
+        svg = fm.stack_svg(self.model(), "T", "", "a test", "")[0]
+        self.assertNotIn("DB_PASSWORD", svg.replace("$DB_PASSWORD", ""))
 
     def test_environment_is_never_drawn(self):
         c = json.loads(SHOP.read_text())
@@ -402,6 +427,19 @@ class TwoProjects(unittest.TestCase):
 
     def test_alone_the_joined_network_is_named_on_the_cards_instead(self):
         self.assertIn(">$DATA_NET<", self.draw(SITE))
+
+    def test_two_projects_with_one_label_never_overwrite_a_service(self):
+        with self.assertRaisesRegex(fm.SpecError, "own label"):
+            self.draw(dict(SITE, services={"db": svc()}), dict(DATA, name="site", services={"db": svc()}))
+
+    def test_a_network_shared_through_a_chain_or_a_container_outside_the_file(self):
+        c = {"name": "x", "networks": {"back": {"name": "x_back"}, "front": {"name": "x_front"}},
+             "services": {"a": svc(networks={"back": {}}), "b": svc(network_mode="service:a"),
+                          "c": svc(network_mode="service:b"), "d": svc(network_mode="container:elsewhere"),
+                          "e": svc(networks={"front": {}})}}
+        m = fm.read_compose(json.dumps(c))
+        self.assertEqual(m["services"]["c"]["networks"], ["back"])
+        self.assertEqual((m["services"]["d"]["networks"], m["services"]["d"]["mode"]), ([], "elsewhere's network"))
 
     def test_one_service_name_in_two_projects_is_drawn_twice_by_project(self):
         out = self.draw(SITE, dict(DATA, services={"engine": svc(), "store": svc()}))

@@ -43,6 +43,9 @@ jobs:
           packaging/release-notes.sh "$version" > /dev/null
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      - name: Install the linter
+        run: pipx install ruff
+
       - name: Prove this version works
         run: make check
 
