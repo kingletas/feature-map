@@ -43,6 +43,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+from collections import Counter
 from pathlib import Path
 
 VERSION = "0.3.0"
@@ -734,14 +735,24 @@ def collapse(svcs):
     return out
 
 
-def home_network(svc, nets):
-    """The box a service is drawn in: the first network its own project owns.
-    An external network it joins belongs to someone else, even when its name
-    sorts first."""
+def network_crowd(names, svcs):
+    """How many of these services are on each network."""
+    return Counter(k for n in names for k in svcs[n]["networks"])
+
+
+def home_network(svc, nets, crowd=None):
+    """The box a service is drawn in: of the networks its own project owns, the
+    one most of the project's services are on, the first on a tie. A database
+    on a side network for one job belongs with the services that use it. An
+    external network it joins belongs to someone else, even when its name sorts
+    first."""
     if not svc["networks"]:
         return None
     owned = [k for k in svc["networks"] if not nets.get(k, {}).get("external")]
-    return owned[0] if owned else svc["networks"][0]
+    if not owned:
+        return svc["networks"][0]
+    crowd = crowd or {}
+    return max(owned, key=lambda k: crowd.get(k, 0))
 
 
 def stack_columns(names, svcs):
@@ -891,7 +902,8 @@ def stack_svg(projects, title, subtitle, source, date):
         # order, so it sits apart from the path instead of on it.
         oneshot = {d for n in mine for d in svcs[n]["after"]} - {d for n in mine for d in svcs[n]["depends"]}
         rest = [n for n in mine if n not in oneshot]
-        home = {n: home_network(svcs[n], nets) for n in rest}
+        crowd = network_crowd(rest, svcs)
+        home = {n: home_network(svcs[n], nets, crowd) for n in rest}
         homes = [h for h in dict.fromkeys(home.values()) if h is not None]
         pre = f"{p['name']} · " if multi else ""
         these = []

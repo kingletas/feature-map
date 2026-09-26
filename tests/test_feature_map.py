@@ -395,6 +395,21 @@ class TwoProjects(unittest.TestCase):
         self.assertEqual(fm.home_network(m["services"]["engine"], m["networks"]), "default")
         self.assertNotIn("NETWORK: DATA", self.draw(SITE))
 
+    def test_a_store_on_a_side_network_sits_with_the_services_that_use_it(self):
+        side = {"name": "side", "networks": {"browser": {}, "default": {}}, "services": {
+            "db": svc(image="tinydb:3", networks={"browser": {}, "default": {}}),
+            "api": svc(networks={"default": {}}, depends_on={"db": {"condition": "service_started"}}, ports=[{"target": 80, "published": "8080"}]),
+            "worker": svc(networks={"default": {}}, depends_on={"db": {"condition": "service_started"}}),
+            "checker": svc(networks={"browser": {}}, depends_on={"db": {"condition": "service_started"}}),
+        }}
+        m = fm.read_compose(json.dumps(side))
+        crowd = fm.network_crowd(list(m["services"]), m["services"])
+        self.assertEqual(fm.home_network(m["services"]["db"], m["networks"], crowd), "default",
+                         "the store is drawn in the network most of its users are on")
+        self.assertEqual(fm.home_network(m["services"]["checker"], m["networks"], crowd), "browser")
+        self.assertEqual(fm.home_network(m["services"]["db"], m["networks"]), "browser",
+                         "with nothing to weigh, the first network it owns")
+
     def test_services_alike_but_for_their_names_are_drawn_once(self):
         m = fm.read_compose(json.dumps(SITE))
         drawn = fm.collapse(m["services"])

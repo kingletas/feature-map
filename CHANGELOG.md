@@ -4,6 +4,7 @@
 
 - **`stack` draws several Compose projects as one picture.** Pass each as `LABEL=FILE`. A network one project declares and another joins as external is drawn as one dashed line into the declaring project's box, with the services that use it named there. The two are matched on the variable that names the network, or on its default, so `${DATA_NET:?}` in one file meets `${DATA_NET:-shared}` in the other.
 - **A service sits in the network its own project owns.** It used to sit in whichever of its networks sorted first, which could be an external one it only joins.
+- **A service on two of its own networks sits in the one most of the project is on.** A database that also joins a side network for one job was drawn in that side network, away from the services that use it.
 - **Waiting for a job to finish is start order, not a path.** A `depends_on` with `service_completed_successfully` becomes an "after" line on the card, and the jobs waited on get their own "runs once, before the rest" box, instead of every service drawing an arrow to them.
 - **Three or more services alike but for their names are drawn once**, as `prefix-*` with a count, when nothing depends on them and none publishes a port. Hovering the card lists them.
 - **An entry can be reached over a network, not only a port**, so a cache behind a shared reverse proxy starts the request path.
