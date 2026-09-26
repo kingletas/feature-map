@@ -520,21 +520,33 @@ def drift(spec, groups):
 
 # --- stack: a Compose file drawn as boxes and paths -------------------------
 
-VAR_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?::?-([^}]*))?\}")
+VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?:(:?-)([^}]*)|:?[?+][^}]*)?\}")
 
 
 def plain(text):
-    """'${HTTP_PORT:-8080}' reads as its default, '8080'; a variable with no
-    default stays a variable name, since the real value is not ours to show."""
-    return VAR_RE.sub(lambda m: m.group(1) if m.group(1) is not None else "$" + m.group(0)[2:-1].split(":")[0], str(text))
+    """'${HTTP_PORT:-8080}' reads as its default, '8080'. A variable with no
+    default, or one that carries only an error message, stays a variable name,
+    since the real value is not ours to show."""
+    return VAR_RE.sub(lambda m: m.group(3) if m.group(2) else "$" + m.group(1), str(text))
+
+
+def join_keys(name):
+    """What a network name can be matched on across two Compose projects: the
+    variable it is set from, and that variable's default. Two files that name a
+    network from the same variable mean the same network, whatever fallback
+    each one gives."""
+    m = VAR_RE.fullmatch(str(name))
+    if not m:
+        return {str(name)}
+    return {"$" + m.group(1)} | ({m.group(3)} if m.group(2) and m.group(3) else set())
 
 
 def port_label(p):
     if isinstance(p, dict):
         pub, target = p.get("published"), p.get("target")
-        return f"{plain(pub)} \u2192 {target}" if pub else str(target)
+        return f"{plain(pub)} → {target}" if pub else str(target)
     parts = plain(p).rsplit(":", 2)
-    return f"{parts[-2]} \u2192 {parts[-1]}" if len(parts) >= 2 else parts[-1]
+    return f"{parts[-2]} → {parts[-1]}" if len(parts) >= 2 else parts[-1]
 
 
 def image_label(svc):
@@ -542,49 +554,110 @@ def image_label(svc):
         return "built here"
     img = plain(svc.get("image", "built here"))
     name = img.split("/")[-1]
-    return name if len(name) <= 30 else name[:29] + "\u2026"
+    return name if len(name) <= 30 else name[:29] + "…"
 
 
-def read_compose(text):
+def read_compose(text, label=None):
     """Docker Compose's resolved form, as `docker compose config --format json`
-    prints it. JSON only: no YAML parser is needed, and the tool runs nothing."""
+    prints it. JSON only: no YAML parser is needed, and the tool runs nothing.
+
+    A dependency that waits for another service to finish is kept apart from
+    the rest as `after`: it is start order, not a path a request takes."""
     c = json.loads(text)
     services = c.get("services") or {}
     if not services:
         raise SpecError("no services in that Compose configuration")
+    project = c.get("name", "")
+    nets = {}
+    for key, v in (c.get("networks") or {}).items():
+        v = v or {}
+        name = str(v.get("name") or "")
+        # Compose names an unnamed network <project>_<key>. That name says
+        # nothing a reader needs, and no other project can mean it.
+        generated = not name or name == f"{project}_{key}"
+        nets[key] = {"external": bool(v.get("external")),
+                     "label": key if generated else plain(name),
+                     "joins": set() if generated else join_keys(name)}
     out = {}
     for name, svc in services.items():
-        nets = svc.get("networks")
-        nets = list(nets.keys()) if isinstance(nets, dict) else (nets or ["default"])
+        svc_nets = svc.get("networks")
+        svc_nets = list(svc_nets.keys()) if isinstance(svc_nets, dict) else (svc_nets or ["default"])
         vols = []
         for v in svc.get("volumes") or []:
             if isinstance(v, dict) and v.get("type") == "volume" and v.get("source"):
                 vols.append(v["source"])
         deps = svc.get("depends_on") or {}
+        if not isinstance(deps, dict):
+            deps = {d: {} for d in deps}
+        after = [d for d, v in deps.items() if (v or {}).get("condition") == "service_completed_successfully"]
         out[name] = {
             "image": image_label(svc),
-            "networks": nets,
+            "networks": svc_nets,
             "ports": [port_label(p) for p in svc.get("ports") or []],
             "volumes": vols,
-            "depends": list(deps.keys()) if isinstance(deps, dict) else list(deps),
+            "depends": [d for d in deps if d not in after],
+            "after": after,
             "health": "healthcheck" in svc and not (svc["healthcheck"] or {}).get("disable"),
             "profiles": svc.get("profiles") or [],
+            "members": [name],
         }
-    nets = {k: bool((v or {}).get("external")) for k, v in (c.get("networks") or {}).items()}
-    return {"name": c.get("name", ""), "services": out, "networks": nets}
+    return {"name": label or project, "services": out, "networks": nets}
+
+
+def collapse(svcs):
+    """Three or more services that differ only in their names are drawn once.
+
+    Six queue consumers built from one image, on the same networks, with the
+    same volumes and dependencies, are one idea to a reader, and six cards of
+    them push the path off the page. Nothing may depend on them and none may
+    publish a port, so no arrow ever has to choose one of them; they must also
+    share the first word of their names, which becomes the card's name."""
+    inbound = {d for s in svcs.values() for d in s["depends"] + s["after"]}
+    groups = {}
+    for n, s in svcs.items():
+        if n in inbound or s["ports"] or "-" not in n:
+            continue
+        key = (n.split("-")[0], s["image"], tuple(s["networks"]), tuple(s["volumes"]), tuple(s["depends"]),
+               tuple(s["after"]), s["health"], tuple(s["profiles"]))
+        groups.setdefault(key, []).append(n)
+    first = {names[0]: names for names in groups.values() if len(names) >= 3}
+    dropped = {n for names in first.values() for n in names}
+    out = {}
+    for n, s in svcs.items():
+        if n in first:
+            names = first[n]
+            words = [m.split("-") for m in names]
+            common = []
+            for part in zip(*words):
+                if len(set(part)) > 1:
+                    break
+                common.append(part[0])
+            out["-".join(common) + "-*"] = dict(s, members=list(names))
+        elif n not in dropped:
+            out[n] = s
+    return out
+
+
+def home_network(svc, nets):
+    """The box a service is drawn in: the first network its own project owns.
+    An external network it joins belongs to someone else, even when its name
+    sorts first."""
+    owned = [k for k in svc["networks"] if not nets.get(k, {}).get("external")]
+    return owned[0] if owned else svc["networks"][0]
 
 
 def stack_columns(names, svcs):
     """Left to right along the request path, returned with the data column.
 
-    The entry is what publishes a port and depends on something; the services
-    it reaches follow its paths. The last column holds the data stores: what is
+    The entry is what the outside reaches, by a published port or over a
+    network another stack owns, and depends on something; the services it
+    reaches follow its paths. The last column holds the data stores: what is
     depended on, depends on nothing, and is used by a service that needs several
     things at once. A service off the path sits with a service it shares a
     volume with, since a shared socket or code volume puts two containers in
     the same tier."""
     depended = {d for n in names for d in svcs[n]["depends"] if d in names}
-    entries = [n for n in names if svcs[n]["ports"] and svcs[n]["depends"] and n not in depended]
+    entries = [n for n in names if (svcs[n]["ports"] or svcs[n].get("outside")) and svcs[n]["depends"] and n not in depended]
     depth = {n: 0 for n in entries}
     frontier = list(entries)
     while frontier:
@@ -613,47 +686,161 @@ def stack_columns(names, svcs):
         if n not in sinks:
             cols.setdefault(depth[n], []).append(n)
     ordered = [cols[k] for k in sorted(cols)]
+    # Each column follows the order of what points into it, so web -> php-fpm
+    # and web-admin -> php-admin run level instead of crossing. What nothing
+    # points to keeps its place, after the rest.
+    for ci in range(1, len(ordered)):
+        row = {m: i for i, m in enumerate(ordered[ci - 1])}
+        def key(n, at=ordered[ci].index, row=row):
+            preds = [row[m] for m in row if n in svcs[m]["depends"]]
+            return (0, sum(preds) / len(preds), at(n)) if preds else (1, 0, at(n))
+        ordered[ci] = sorted(ordered[ci], key=key)
     return ordered, sinks
 
 
 CARD_W, CARD_GAP, COL_GAP = 250, 18, 110
+NAME_CHAR_W, SMALL_CHAR_W, TAG_CHAR_W = 8.9, 6.9, 7.2
+
+
+def pills_width(labels):
+    return sum(len(v) * TAG_CHAR_W + 22 for v in labels[:3]) - 6 if labels else 0
+
+
+def after_line(svc):
+    return "after " + ", ".join(svc["after"]) if svc["after"] else ""
+
+
+def count_badge(svc):
+    return f"×{len(svc['members'])}" if len(svc["members"]) > 1 else ""
+
+
+def card_width(n, svc):
+    """Wide enough for the longest line on the card. Widths are estimated from
+    character counts, so this errs wide."""
+    head = len(n) * NAME_CHAR_W + (26 if svc["health"] else 0) + (len(count_badge(svc)) * TAG_CHAR_W + 26 if count_badge(svc) else 0)
+    lines = [head, len(svc["image"]) * SMALL_CHAR_W, len(after_line(svc)) * SMALL_CHAR_W,
+             pills_width(svc["ports"]), pills_width(svc["volumes"]), pills_width(svc.get("outside", []))]
+    return max(CARD_W, int(32 + max(lines) + 0.5))
 
 
 def card_height(svc):
-    return 58 + (22 if svc["ports"] else 0) + (22 if svc["volumes"] else 0)
+    return (58 + (22 if svc["ports"] else 0) + (22 if svc["volumes"] else 0)
+            + (22 if svc.get("outside") else 0) + (18 if svc["after"] else 0))
 
 
-def stack_svg(model, title, subtitle, source, date):
-    svcs = model["services"]
-    multi_net = len([n for n in model["networks"] if n]) > 1
-    if multi_net:
-        boxes = [(f"network: {n}", [s for s in svcs if svcs[s]["networks"][0] == n], model["networks"][n]) for n in model["networks"]]
-    else:
-        boxes = [("always running", [s for s in svcs if not svcs[s]["profiles"]], False)]
-        for prof in sorted({p for s in svcs.values() for p in s["profiles"]}):
-            boxes.append((f"opt-in profile: {prof}", [s for s in svcs if svcs[s]["profiles"] and svcs[s]["profiles"][0] == prof], True))
-    boxes = [b for b in boxes if b[1]]
+def stack_svg(projects, title, subtitle, source, date):
+    """One project, or several that run side by side. Services in different
+    projects never depend on each other; what connects them is a network one
+    declares and another joins as external, drawn as one line between boxes."""
+    if isinstance(projects, dict):
+        projects = [projects]
+    multi = len(projects) > 1
+    svcs = {}
+    for pi, p in enumerate(projects):
+        for n, s in collapse(p["services"]).items():
+            if n in svcs:
+                raise SpecError(f"{n} is a service in two of these projects; draw them separately")
+            svcs[n] = dict(s, project=pi)
 
-    pos, frames, buses = {}, [], []
+    # An external network one project joins and another declares, matched on
+    # the variable or the name that sets it.
+    joins = []
+    for pi, p in enumerate(projects):
+        for k, net in p["networks"].items():
+            if not net["external"]:
+                continue
+            for qi, q in enumerate(projects):
+                hit = next((k2 for k2, n2 in q["networks"].items()
+                            if qi != pi and not n2["external"] and n2["joins"] & net["joins"]), None)
+                if hit:
+                    joins.append((pi, k, qi, hit))
+                    break
+    joined = {(pi, k) for pi, k, _, _ in joins}
+    for s in svcs.values():
+        nets = projects[s["project"]]["networks"]
+        s["outside"] = [nets[k]["label"] for k in s["networks"]
+                        if nets.get(k, {}).get("external") and (s["project"], k) not in joined]
+
+    boxes, lede = [], ""
+    for pi, p in enumerate(projects):
+        mine = [n for n, s in svcs.items() if s["project"] == pi]
+        nets = p["networks"]
+        # A service others wait on to finish runs once and exits; it is start
+        # order, so it sits apart from the path instead of on it.
+        oneshot = {d for n in mine for d in svcs[n]["after"]} - {d for n in mine for d in svcs[n]["depends"]}
+        rest = [n for n in mine if n not in oneshot]
+        home = {n: home_network(svcs[n], nets) for n in rest}
+        homes = list(dict.fromkeys(home.values()))
+        pre = f"{p['name']} · " if multi else ""
+        these = []
+        if len(homes) > 1:
+            for h in homes:
+                net = nets.get(h, {})
+                these.append({"label": pre + "network: " + net.get("label", h), "names": [n for n in rest if home[n] == h],
+                              "dashed": net.get("external", False), "path": True, "net": h})
+        else:
+            h = homes[0] if homes else None
+            these.append({"label": pre + "always running", "names": [n for n in rest if not svcs[n]["profiles"]],
+                          "dashed": False, "path": True, "net": h})
+            for prof in sorted({pr for n in rest for pr in svcs[n]["profiles"]}):
+                these.append({"label": pre + f"opt-in profile: {prof}", "dashed": True, "path": False, "net": h,
+                              "names": [n for n in rest if svcs[n]["profiles"] and svcs[n]["profiles"][0] == prof]})
+            if not multi and h:
+                lede = f"Everything here lives on one network ({nets.get(h, {}).get('label', h)}), so the boxes say when a service runs."
+        these.append({"label": pre + "runs once, before the rest", "names": [n for n in mine if n in oneshot],
+                      "dashed": False, "path": False, "net": None})
+        these = [b for b in these if b["names"]]
+        if these:
+            these[0]["path"] = True
+        for b in these:
+            b["project"] = pi
+        boxes += these
+
+    def box_for(pi, net=None):
+        """The box holding a project's services on a network, or its first box."""
+        mine = [b for b in boxes if b["project"] == pi]
+        return next((b for b in mine if net and b["net"] == net), mine[0])
+
+    links = []
+    for pi, k, qi, k2 in joins:
+        users = [n for n, s in svcs.items() if s["project"] == pi and k in s["networks"]]
+        if not users:
+            continue
+        shown = [n + (f" ({count_badge(svcs[n])})" if count_badge(svcs[n]) else "") for n in users]
+        listed = ", ".join(shown[:-1]) + " and " + shown[-1] if len(shown) > 1 else shown[0]
+        dst = box_for(qi, k2)
+        dst["note"] = f"Reached from {projects[pi]['name']} over its {k} network, by {listed}."
+        links.append((box_for(pi), dst))
+
+    pos, frame_of, buses = {}, {}, []
     y = TOP - 40
     main_w = 0
     row_x, row_h = 60, 0
-    for bi, (label, names, dashed) in enumerate(boxes):
-        if bi == 0 or multi_net:
+    for b in boxes:
+        names = b["names"]
+        if b["path"]:
             cols, sinks = stack_columns(names, svcs)
             if sinks:
                 cols = cols + [sinks]
         else:
             per = min(4, len(names))
             cols, sinks = [names[i::per] for i in range(per)], []
+        widths = [max(card_width(n, svcs[n]) for n in col) for col in cols]
         heights = [sum(card_height(svcs[n]) + CARD_GAP for n in col) - CARD_GAP for col in cols]
-        bw = len(cols) * CARD_W + (len(cols) - 1) * COL_GAP + 80
-        bh = max(heights) + 90
-        if bi == 0 or multi_net:
+        head = 60 + (26 if b.get("note") else 0)
+        bw = sum(widths) + (len(cols) - 1) * COL_GAP + 80
+        if b.get("note"):
+            bw = max(bw, int(len(b["note"]) * SMALL_CHAR_W + 60))
+        bh = max(heights) + head + 30
+        if b["path"]:
+            if row_h:
+                # Close the row of opt-in boxes above before the next path.
+                y += row_h + 50
+                row_x, row_h = 60, 0
             bx, by = 60, y
             y += bh + 50
         else:
-            # Opt-in boxes flow in a row under the main box, wrapping when full.
+            # Opt-in boxes flow in a row under their path, wrapping when full.
             if row_x + bw > max(main_w, 1500) + 60 and row_x > 60:
                 row_x, y = 60, y + row_h + 40
                 row_h = 0
@@ -661,16 +848,18 @@ def stack_svg(model, title, subtitle, source, date):
             row_x += bw + 40
             row_h = max(row_h, bh)
         main_w = max(main_w, bx - 60 + bw)
-        frames.append((bx, by, bw, bh, label, dashed))
+        b["frame"] = (bx, by, bw, bh)
+        x = bx + 40
         for ci, col in enumerate(cols):
             # The main path is centred so it reads as one line; opt-in boxes
             # are top-aligned, since they are lists rather than a path.
-            centred = bi == 0 or multi_net
-            cy = by + 60 + ((max(heights) - heights[ci]) / 2 if centred else 0)
+            cy = by + head + ((max(heights) - heights[ci]) / 2 if b["path"] else 0)
             for n in col:
                 h = card_height(svcs[n])
-                pos[n] = (bx + 40 + ci * (CARD_W + COL_GAP), cy, CARD_W, h, dashed)
+                pos[n] = (x, cy, widths[ci], h, b["dashed"])
+                frame_of[n] = b
                 cy += h + CARD_GAP
+            x += widths[ci] + COL_GAP
         if sinks:
             first = pos[sinks[0]]
             last = pos[sinks[-1]]
@@ -688,19 +877,17 @@ def stack_svg(model, title, subtitle, source, date):
         return (f'<path d="M{x1:.1f},{y1:.1f} C{mid:.1f},{y1:.1f} {mid:.1f},{y2:.1f} {x2 - 6:.1f},{y2:.1f}" '
                 'stroke="#475569" stroke-width="1.8" fill="none" opacity=".75" marker-end="url(#arr)"/>')
 
-    main_bottom = frames[0][1] + frames[0][3] if frames else 0
-
-    def route(points):
+    def route(points, style='stroke="#475569" stroke-width="1.8"'):
         d = "M" + " L".join(f"{x:.1f},{y:.1f}" for x, y in points)
-        return (f'<path d="{d}" stroke="#475569" stroke-width="1.8" fill="none" opacity=".75" '
-                'stroke-linejoin="round" marker-end="url(#arr)"/>')
+        return f'<path d="{d}" {style} fill="none" opacity=".75" stroke-linejoin="round" marker-end="url(#arr)"/>'
 
-    def climb(n, x2, y2, up_into=False):
-        """An edge from a box below the main one never passes behind a card:
-        it rises to the gap under the main box, runs along it, climbs the gutter
-        beside the target's column, and turns into the target."""
+    def climb(n, target, x2, y2, up_into=False):
+        """An edge from a box below its target's never passes behind a card:
+        it rises to the gap under the target's box, runs along it, climbs the
+        gutter beside the target's column, and turns into the target."""
         x, yy, w, _, _ = pos[n]
-        lane = main_bottom + 22
+        _, fy, _, fh = frame_of[target]["frame"]
+        lane = fy + fh + 22
         # Leave from the right of the card, clear of its box's label above it.
         x1 = x + w - 40
         if up_into:
@@ -712,6 +899,14 @@ def stack_svg(model, title, subtitle, source, date):
         return pos[n][1] > pos[d][1] + pos[d][3] + 40
 
     edges = []
+    for src, dst in links:
+        # One line per joined network, down the left margin, so it never
+        # crosses a card.
+        sx, sy, _, sh = src["frame"]
+        dx, dy, _, _ = dst["frame"]
+        y1, y2 = sy + sh - 36, dy + 46
+        edges.append(route([(sx, y1), (32, y1), (32, y2), (dx - 6, y2)],
+                           'stroke="#475569" stroke-width="2.4" stroke-dasharray="8 5"'))
     for members, bus_x, top, bottom in buses:
         edges.append(f'<path d="M{bus_x:.1f},{top + 10:.1f} L{bus_x:.1f},{bottom - 10:.1f}" stroke="#475569" stroke-width="3" stroke-linecap="round" opacity=".55"/>')
         for m in members:
@@ -727,12 +922,12 @@ def stack_svg(model, title, subtitle, source, date):
             if len(hit) >= 3:
                 x1, y1 = anchor(n, "r")
                 target_y = min(max(y1, top + 20), bottom - 20)
-                edges.append(climb(n, bus_x, bottom - 4, up_into=True) if pos[n][1] > bottom + 40 else curve(x1, y1, bus_x + 6, target_y))
+                edges.append(climb(n, hit[0], bus_x, bottom - 4, up_into=True) if pos[n][1] > bottom + 40 else curve(x1, y1, bus_x + 6, target_y))
                 deps = [d for d in deps if d not in members]
         for d in deps:
             if below(n, d):
                 x2, y2 = anchor(d, "l")
-                edges.append(climb(n, x2, y2))
+                edges.append(climb(n, d, x2, y2))
                 continue
             (x1, y1), (x2, y2) = anchor(n, "r"), anchor(d, "l")
             if x2 < x1:
@@ -745,37 +940,64 @@ def stack_svg(model, title, subtitle, source, date):
     vol_colors = {v: PALETTE[i % len(PALETTE)] for i, v in enumerate(sorted(v for v, u in shared.items() if len(u) > 1))}
 
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" role="img">',
-           f"<title>{esc(title)} stack</title>", f"<style>{STYLE}.cn{{font:700 16px 'Inter',system-ui,sans-serif;fill:#1f2937}}.ci{{font:500 12.5px 'Inter',system-ui,sans-serif;fill:#6b7280}}.tag{{font:600 12px 'Inter',system-ui,sans-serif}}.bl{{font:700 13px 'Inter',system-ui,sans-serif;letter-spacing:.08em}}</style>",
+           f"<title>{esc(title)} stack</title>", f"<style>{STYLE}.cn{{font:700 16px 'Inter',system-ui,sans-serif;fill:#1f2937}}.ci{{font:500 12.5px 'Inter',system-ui,sans-serif;fill:#6b7280}}.tag{{font:600 12px 'Inter',system-ui,sans-serif}}.bl{{font:700 13px 'Inter',system-ui,sans-serif;letter-spacing:.08em}}.bn{{font:500 13px 'Inter',system-ui,sans-serif;fill:#475569}}</style>",
            '<defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#475569"/></marker></defs>',
            f'<rect width="{W}" height="{H}" fill="#f7f5ef"/>',
            f'<text x="60" y="92" class="tt">{esc(title)}</text>',
            f'<text x="62" y="130" class="st">{esc(subtitle)}</text>']
-    lx = W - 420
-    out.append(f'<g transform="translate({lx},48)">'
-               '<path d="M0,8 L34,8" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)"/><text x="46" y="13" class="lg">depends on</text>'
-               '<rect x="0" y="28" width="34" height="16" rx="4" fill="#7c3aed" fill-opacity=".16"/><text x="46" y="41" class="lg">same colour: a volume shared between services</text>'
-               '<rect x="0" y="56" width="34" height="18" rx="6" fill="none" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6 4"/><text x="46" y="70" class="lg">'
-               + ("external network" if multi_net else "runs only when its profile is asked for") + "</text>"
-               '<circle cx="17" cy="94" r="5" fill="#16a34a"/><text x="46" y="99" class="lg">has a health check</text></g>')
-    if not multi_net:
-        net = next(iter(model["networks"]), "default")
-        out.append(f'<text x="62" y="172" class="lede">One network ({esc(net)}), so the boxes are Compose profiles.</text>')
-    for bx, by, bw, bh, label, dashed in frames:
-        out.append(f'<rect x="{bx}" y="{by}" width="{bw}" height="{bh}" rx="22" fill="{"none" if dashed else "#ffffff"}" fill-opacity=".55" stroke="#94a3b8" stroke-width="1.6"{dash(dashed, "8 6")}/>')
-        out.append(f'<text x="{bx + 24}" y="{by + 32}" class="bl" fill="#64748b">{esc(label.upper())}</text>')
+
+    # The legend names only what this drawing uses.
+    keys = ['<path d="M0,{c} L34,{c}" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)"/>|depends on',
+            '<rect x="0" y="{t}" width="34" height="16" rx="4" fill="#7c3aed" fill-opacity=".16"/>|same colour: a volume shared between services']
+    dashed_box = '<rect x="0" y="{t}" width="34" height="18" rx="6" fill="none" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6 4"/>|'
+    if any(b["dashed"] and b["label"].split("· ")[-1].startswith("opt-in") for b in boxes):
+        keys.append(dashed_box + "runs only when its profile is asked for")
+    if any(b["dashed"] and not b["label"].split("· ")[-1].startswith("opt-in") for b in boxes):
+        keys.append(dashed_box + "external network")
+    if links:
+        keys.append('<path d="M0,{c} L34,{c}" stroke="#475569" stroke-width="2.4" stroke-dasharray="8 5"/>|a network one project declares and another joins')
+    if any(s["outside"] for s in svcs.values()):
+        keys.append('<rect x="0" y="{t}" width="34" height="18" rx="9" fill="none" stroke="#64748b" stroke-width="1.3" stroke-dasharray="4 3"/>|joins a network this drawing does not show')
+    if any(len(s["members"]) > 1 for s in svcs.values()):
+        keys.append('<text x="17" y="{b}" text-anchor="middle" class="tag" fill="#334155">×N</text>|N services alike but for their names, drawn once')
+    keys.append('<circle cx="17" cy="{c}" r="5" fill="#16a34a"/>|has a health check')
+    legend = []
+    for i, k in enumerate(keys):
+        mark, text = k.split("|", 1)
+        top = i * 28
+        legend.append(mark.format(t=top, c=top + 8, b=top + 13) + f'<text x="46" y="{top + 13}" class="lg">{esc(text)}</text>')
+    out.append(f'<g transform="translate({W - 440},48)">' + "".join(legend) + "</g>")
+    if lede:
+        out.append(f'<text x="62" y="172" class="lede">{esc(lede)}</text>')
+    for b in boxes:
+        bx, by, bw, bh = b["frame"]
+        out.append(f'<rect x="{bx}" y="{by}" width="{bw}" height="{bh}" rx="22" fill="{"none" if b["dashed"] else "#ffffff"}" fill-opacity=".55" stroke="#94a3b8" stroke-width="1.6"{dash(b["dashed"], "8 6")}/>')
+        out.append(f'<text x="{bx + 24}" y="{by + 32}" class="bl" fill="#64748b">{esc(b["label"].upper())}</text>')
+        if b.get("note"):
+            out.append(f'<text x="{bx + 24}" y="{by + 56}" class="bn">{esc(b["note"])}</text>')
     out += edges
     for n, (x, yy, w, h, dashed) in pos.items():
         svc = svcs[n]
-        out.append(f'<rect x="{x}" y="{yy:.1f}" width="{w}" height="{h}" rx="14" fill="#fff" stroke="{"#cbd5e1" if dashed else "#1f2a37"}" stroke-width="{1.4 if dashed else 1.8}"/>')
+        # A profiled service inside a box that is not about profiles is dashed itself.
+        own_dash = bool(svc["profiles"]) and not dashed
+        members = f"<title>{esc(', '.join(svc['members']))}</title>" if len(svc["members"]) > 1 else ""
+        out.append(f'<rect x="{x}" y="{yy:.1f}" width="{w}" height="{h}" rx="14" fill="#fff" stroke="{"#cbd5e1" if dashed else "#1f2a37"}" stroke-width="{1.4 if dashed else 1.8}"{dash(own_dash, "6 4")}>{members}</rect>')
         out.append(f'<text x="{x + 16}" y="{yy + 26:.1f}" class="cn">{esc(n)}</text>')
+        if count_badge(svc):
+            bxx = x + 16 + len(n) * NAME_CHAR_W + 8
+            bw_ = len(count_badge(svc)) * TAG_CHAR_W + 16
+            out.append(f'<rect x="{bxx:.1f}" y="{yy + 12:.1f}" width="{bw_:.1f}" height="19" rx="9.5" fill="#e2e8f0"/><text x="{bxx + 8:.1f}" y="{yy + 26:.1f}" class="tag" fill="#334155">{esc(count_badge(svc))}</text>')
         if svc["health"]:
             out.append(f'<circle cx="{x + w - 18}" cy="{yy + 20:.1f}" r="5" fill="#16a34a"><title>health check</title></circle>')
         out.append(f'<text x="{x + 16}" y="{yy + 46:.1f}" class="ci">{esc(svc["image"])}</text>')
         ty = yy + 70
+        if svc["after"]:
+            out.append(f'<text x="{x + 16}" y="{yy + 64:.1f}" class="ci">{esc(after_line(svc))}</text>')
+            ty += 18
         if svc["ports"]:
             tx = x + 16
             for p in svc["ports"][:3]:
-                tw = len(p) * 7.2 + 16
+                tw = len(p) * TAG_CHAR_W + 16
                 out.append(f'<rect x="{tx}" y="{ty - 14:.1f}" width="{tw:.1f}" height="19" rx="9.5" fill="#dbeafe"/><text x="{tx + 8}" y="{ty:.1f}" class="tag" fill="#1d4ed8">{esc(p)}</text>')
                 tx += tw + 6
             ty += 22
@@ -783,10 +1005,17 @@ def stack_svg(model, title, subtitle, source, date):
             tx = x + 16
             for v in svc["volumes"][:3]:
                 col = vol_colors.get(v, "#475569")
-                tw = len(v) * 7.2 + 16
+                tw = len(v) * TAG_CHAR_W + 16
                 out.append(f'<rect x="{tx}" y="{ty - 14:.1f}" width="{tw:.1f}" height="19" rx="4" fill="{col}" fill-opacity=".14"/><text x="{tx + 8}" y="{ty:.1f}" class="tag" fill="{col}">{esc(v)}</text>')
                 tx += tw + 6
-    footer = "DRAWN FROM " + source + (f"  \u00b7  {date}" if date else "")
+            ty += 22
+        if svc["outside"]:
+            tx = x + 16
+            for v in svc["outside"][:3]:
+                tw = len(v) * TAG_CHAR_W + 16
+                out.append(f'<rect x="{tx}" y="{ty - 14:.1f}" width="{tw:.1f}" height="19" rx="9.5" fill="none" stroke="#64748b" stroke-width="1.2" stroke-dasharray="4 3"/><text x="{tx + 8}" y="{ty:.1f}" class="tag" fill="#475569">{esc(v)}</text>')
+                tx += tw + 6
+    footer = "DRAWN FROM " + source + (f"  ·  {date}" if date else "")
     out.append(f'<text x="{W / 2:.1f}" y="{H - 28}" text-anchor="middle" class="ft">{esc(footer.upper())}</text></svg>')
     return "\n".join(out) + "\n", W, H
 
@@ -813,7 +1042,8 @@ def main(argv=None):
     f.add_argument("kind", choices=["help", "make"])
     f.add_argument("source", help="a file, or - for standard input")
     k = sub.add_parser("stack", help="draw a Docker Compose stack from `docker compose config --format json`")
-    k.add_argument("source", help="the JSON, a file or - for standard input")
+    k.add_argument("source", nargs="+",
+                   help="the JSON, a file or - for standard input; several projects as LABEL=FILE, one after another")
     k.add_argument("-o", "--output")
     k.add_argument("--title")
     k.add_argument("--subtitle", default="The services, and how they connect")
@@ -822,17 +1052,24 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     if args.cmd == "stack":
+        projects = []
+        for arg in args.source:
+            label, path = arg.split("=", 1) if "=" in arg and not Path(arg).exists() else ("", arg)
+            try:
+                text = sys.stdin.read() if path == "-" else Path(path).read_text(encoding="utf-8")
+                projects.append(read_compose(text, label or None))
+            except (SpecError, json.JSONDecodeError) as exc:
+                print(f"feature-map: {path}: {exc}", file=sys.stderr)
+                return 1
+            except OSError as exc:
+                print(f"feature-map: {exc}", file=sys.stderr)
+                return 2
+        title = args.title or " + ".join(p["name"] for p in projects if p["name"]) or "Stack"
         try:
-            text = sys.stdin.read() if args.source == "-" else Path(args.source).read_text(encoding="utf-8")
-            model = read_compose(text)
-        except (SpecError, json.JSONDecodeError) as exc:
-            print(f"feature-map: {args.source}: {exc}", file=sys.stderr)
-            return 1
-        except OSError as exc:
+            body, w, h = stack_svg(projects, title, args.subtitle, args.source_name, args.date)
+        except SpecError as exc:
             print(f"feature-map: {exc}", file=sys.stderr)
-            return 2
-        title = args.title or model["name"] or "Stack"
-        body, w, h = stack_svg(model, title, args.subtitle, args.source_name, args.date)
+            return 1
         return write_output(body, w, h, title, args.output)
 
     if args.cmd == "draft":

@@ -58,9 +58,19 @@ Details are in [docs/format.md](docs/format.md#drafting-from-a-tool-and-checking
 docker compose config --no-interpolate --format json | feature-map stack - -o stack.png
 ```
 
-draws the services and how they connect, in the same visual language as the feature map. `--no-interpolate` keeps secrets as `${VARIABLE}` placeholders, and the diagram shows a variable's name, never its value. [`examples/shop-stack.json`](examples/shop-stack.json) is an invented stack to try it on.
+draws the services and how they connect, in the same visual language as the feature map. `--no-interpolate` keeps secrets as `${VARIABLE}` placeholders, and the diagram shows a variable's name, never its value. **Keep the flag**: without it, Compose also copies every `env_file` into its output, values and all (seen with Compose 2.31). The diagram never draws environment variables either way, but the JSON you pipe in would hold them. [`examples/shop-stack.json`](examples/shop-stack.json) is an invented stack to try it on.
 
-It lays a stack out along its request path from what Compose declares: `depends_on`, profiles, networks, ports and named volumes. **It has been tried on a stack of about twenty services;** much larger ones may need grouping it does not do yet.
+It lays a stack out along its request path from what Compose declares: `depends_on`, profiles, networks, ports and named volumes. A service that other services wait on to finish is drawn as start order rather than as a path, and three or more services that differ only in their names are drawn once with a count.
+
+**A stack that runs as several Compose projects** is drawn as one picture. Give each project a label:
+
+```bash
+feature-map stack site=site.json data=data.json --title Tinyshop -o stack.png
+```
+
+A network one project declares and another joins as external becomes a single line between their boxes. They are matched on the variable that names the network, or on its default, so the two files don't need to agree on a literal name.
+
+**It has been tried on stacks of about twenty services**, one of them split across two projects; much larger ones may need grouping it does not do yet.
 
 ## Outputs
 

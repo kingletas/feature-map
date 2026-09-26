@@ -252,6 +252,93 @@ class Stack(unittest.TestCase):
             fm.read_compose('{"services": {}}')
 
 
+def svc(**kw):
+    return dict({"image": "tinyapp:1"}, **kw)
+
+
+# An invented shop that runs as two projects: a site, and a data tier it joins
+# over a network whose name both files take from one variable.
+SITE = {
+    "name": "site",
+    "networks": {"default": {"name": "site_default"},
+                 "data": {"name": "${DATA_NET:?set it}", "external": True},
+                 "edge": {"name": "${EDGE_NET:-edge_default}", "external": True}},
+    "services": {
+        "gate": svc(image="gatekeeper:2", networks={"default": {}, "edge": {}}, depends_on={"front": {"condition": "service_started"}}),
+        "front": svc(networks={"default": {}}, depends_on={"engine": {"condition": "service_started"},
+                                                          "unpack": {"condition": "service_completed_successfully"}}),
+        "engine": svc(networks={"data": {}, "default": {}}),
+        "unpack": svc(networks={"default": {}}),
+        "worker-mail": svc(networks={"data": {}, "default": {}}),
+        "worker-images": svc(networks={"data": {}, "default": {}}),
+        "worker-feeds": svc(networks={"data": {}, "default": {}}),
+    },
+}
+DATA = {
+    "name": "data",
+    "networks": {"default": {"name": "${DATA_NET:-shared-data}"}},
+    "services": {"store": svc(image="tinydb:3"), "cache": svc(image="tinycache:1")},
+}
+
+
+class TwoProjects(unittest.TestCase):
+    def draw(self, *projects):
+        return fm.stack_svg([fm.read_compose(json.dumps(p)) for p in projects], "T", "", "a test", "")[0]
+
+    def test_a_variable_with_only_an_error_message_stays_a_name(self):
+        self.assertEqual(fm.plain("${DATA_NET:?set it}"), "$DATA_NET")
+        self.assertEqual(fm.plain("${EDGE_NET:-edge_default}"), "edge_default")
+
+    def test_a_service_sits_in_its_own_network_not_one_it_joins(self):
+        m = fm.read_compose(json.dumps(SITE))
+        self.assertEqual(fm.home_network(m["services"]["engine"], m["networks"]), "default")
+        self.assertNotIn("NETWORK: DATA", self.draw(SITE))
+
+    def test_services_alike_but_for_their_names_are_drawn_once(self):
+        m = fm.read_compose(json.dumps(SITE))
+        drawn = fm.collapse(m["services"])
+        self.assertIn("worker-*", drawn)
+        self.assertEqual(drawn["worker-*"]["members"], ["worker-mail", "worker-images", "worker-feeds"])
+        self.assertIn("engine", drawn, "a service something depends on is never folded")
+        self.assertIn("\u00d73", self.draw(SITE))
+
+    def test_waiting_for_a_job_to_finish_is_start_order_not_an_arrow(self):
+        m = fm.read_compose(json.dumps(SITE))
+        self.assertEqual(m["services"]["front"]["after"], ["unpack"])
+        self.assertNotIn("unpack", m["services"]["front"]["depends"])
+        out = self.draw(SITE)
+        self.assertIn("RUNS ONCE, BEFORE THE REST", out)
+        self.assertIn(">after unpack<", out)
+
+    def test_an_entry_reached_over_an_outside_network_starts_the_path(self):
+        m = fm.read_compose(json.dumps(SITE))
+        for s in m["services"].values():
+            s["outside"] = ["edge_default"] if "edge" in s["networks"] else []
+        cols, _ = fm.stack_columns(["gate", "front", "engine"], m["services"])
+        self.assertEqual(cols, [["gate"], ["front"], ["engine"]])
+
+    def test_two_projects_join_on_the_variable_that_names_their_network(self):
+        out = self.draw(SITE, DATA)
+        self.assertIn("Reached from site over its data network, by engine and worker-* (\u00d73).", out)
+        self.assertEqual(out.count('stroke-dasharray="8 5" fill="none"'), 1, "one line for the one joined network")
+        self.assertIn(">edge_default<", out, "a network nothing here declares is named on the card")
+        self.assertNotIn(">$DATA_NET<", out, "a joined network is drawn as a line, not named on cards")
+
+    def test_alone_the_joined_network_is_named_on_the_cards_instead(self):
+        self.assertIn(">$DATA_NET<", self.draw(SITE))
+
+    def test_one_service_name_in_two_projects_is_refused(self):
+        clash = dict(DATA, services={"engine": svc()})
+        with self.assertRaises(fm.SpecError):
+            self.draw(SITE, clash)
+
+    def test_a_long_name_widens_its_card(self):
+        long = {"name": "x", "services": {"a-service-with-a-very-long-descriptive-name": svc()}}
+        out = self.draw(long)
+        width = float(re.search(r'<rect x="[\d.]+" y="[\d.]+" width="([\d.]+)" height="[\d.]+" rx="14"', out).group(1))
+        self.assertGreater(width, len("a-service-with-a-very-long-descriptive-name") * 8.6)
+
+
 class Drawing(unittest.TestCase):
     def test_svg_escapes_what_it_draws(self):
         s = spec_from(OUTLINE.replace("open a file", "open <b>&</b> a file"))
