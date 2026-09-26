@@ -22,12 +22,19 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Work out which version this is
         id: pick
+        # Values reach the script through the environment, never pasted into
+        # it, so a version or tag name cannot become shell.
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            version="${{ inputs.version }}"
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            version="$INPUT_VERSION"
           else
             version="${GITHUB_REF_NAME#v}"
           fi
@@ -42,8 +49,9 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.pick.outputs.version }}
         run: |
-          version="${{ steps.pick.outputs.version }}"
+          version="$VERSION"
           packaging/release-notes.sh "$version" > notes.md
           if gh release view "v${version}" >/dev/null 2>&1; then
             echo "v${version} exists: updating its notes"

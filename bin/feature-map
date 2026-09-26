@@ -15,7 +15,7 @@ Usage:
     feature-map check SPEC          validate the outline and print what it holds
     feature-map draft help|make SOURCE --title T    draft an outline from help text or a Makefile
     feature-map drift SPEC help|make SOURCE         what the tool has that the map does not show
-    feature-map stack COMPOSE_JSON [-o OUT]         draw a Docker Compose stack (experimental)
+    feature-map stack [LABEL=]COMPOSE_JSON... [-o OUT]   draw a Docker Compose stack (experimental)
     feature-map --version
 
 SPEC is a Markdown outline (see docs/format.md) or the same thing as JSON.
@@ -26,11 +26,12 @@ its path in FEATURE_MAP_BROWSER.
 SOURCE is a file, or - to read standard input: `mytool --help | feature-map
 draft help - --title Mytool`. Nothing is ever run on your behalf.
 
-Exit codes: 0 done (drift: nothing drifted), 1 the outline is invalid or has
-drifted, 2 bad usage, 3 png failed.
+Exit codes: 0 done (drift: nothing drifted), 1 the input is refused, the map
+has drifted, or a draft found no commands, 2 bad usage, 3 png failed.
 """
 
 import argparse
+import datetime
 import html
 import json
 import math
@@ -69,8 +70,10 @@ class SpecError(ValueError):
 # --- reading the outline -----------------------------------------------------
 
 KEY_RE = re.compile(r"^([a-z][a-z-]*):\s*(.*)$")
+SETTINGS = ("source", "date", "center", "center-sub", "omit", "planned-label")
 TAG_RE = re.compile(r"\s*\[planned\]\s*$", re.IGNORECASE)
-HEAD_RE = re.compile(r"^\*\*(.+?)\*\*:?\s*(.*)$")
+HEAD_RE = re.compile(r"^\*\*(.+?)\*\*(?::\s*(.*)|\s*$)")
+HEX_RE = re.compile(r"#(?:[0-9A-Fa-f]{3,4}|[0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})")
 
 
 def parse_markdown(text):
@@ -99,10 +102,13 @@ def parse_markdown(text):
             item = {"text": body, "planned": planned}
             m = HEAD_RE.match(body)
             if m:
-                item = {"head": m.group(1), "text": m.group(2), "planned": planned}
+                item = {"head": m.group(1), "text": m.group(2) or "", "planned": planned}
             group["items"].append(item)
         elif group is None and KEY_RE.match(line):
             key, value = KEY_RE.match(line).groups()
+            if key not in SETTINGS:
+                raise SpecError(f"line {n}: {key + ':'!r} is not a setting; the settings are "
+                                + ", ".join(k + ":" for k in SETTINGS))
             spec[key.replace("-", "_")] = value.strip()
         elif group is None:
             spec["lede"].append(line.strip())
@@ -111,9 +117,17 @@ def parse_markdown(text):
     return spec
 
 
+def read_text(path):
+    """A file, or standard input for '-'. A byte-order mark is dropped, since
+    one in front of '# title' would hide the title."""
+    return sys.stdin.read().lstrip("\ufeff") if path == "-" else Path(path).read_text(encoding="utf-8-sig")
+
+
 def load(path):
-    text = Path(path).read_text(encoding="utf-8")
+    text = read_text(path)
     spec = json.loads(text) if str(path).endswith(".json") else parse_markdown(text)
+    if not isinstance(spec, dict):
+        raise SpecError("a JSON outline is an object with a title, a source and groups")
     return normalise(spec)
 
 
@@ -128,17 +142,26 @@ def normalise(spec):
         raise SpecError("the outline has no '## group'")
     seen = {}
     for gi, g in enumerate(groups):
+        if not isinstance(g, dict) or not g.get("name"):
+            raise SpecError(f"group {gi + 1} has no name")
         g.setdefault("planned", False)
         if not g.get("items"):
             raise SpecError(f"group {g.get('name')!r} has no items")
         for it in g["items"]:
             if isinstance(it, str):
                 it = {"text": it}
-            label = ((it.get("head") or "") + " " + it.get("text", "")).strip().lower()
+            # A feature is its bold name when it has one: the same name under
+            # two groups is the same feature, however it is described.
+            label = (it.get("head") or it.get("text", "")).strip().lower()
             if label in seen:
                 raise SpecError(f"{label!r} appears twice, under {seen[label]!r} and {g['name']!r}")
             seen[label] = g["name"]
         g["items"] = [({"text": i} if isinstance(i, str) else i) for i in g["items"]]
+        # A colour is written into SVG attributes as it stands, so anything but
+        # a hex colour is refused rather than escaped: an outline from someone
+        # else could otherwise close the attribute and add a script.
+        if "color" in g and not HEX_RE.fullmatch(str(g["color"])):
+            raise SpecError(f"group {g.get('name')!r}: color must be a hex colour such as #2563eb")
         g.setdefault("color", PLANNED if g["planned"] else PALETTE[gi % len(PALETTE)])
     spec.setdefault("subtitle", "")
     spec.setdefault("center", spec["title"])
@@ -188,10 +211,15 @@ def layout(spec):
 
     heights = [column_height(left), column_height(right)]
     rows = math.ceil(len(bottom[0]["items"]) / 3) if bottom else 0
+    # The planned row under the centre is a grid of three; its pitch comes from
+    # its own widest and tallest pills, so long planned items never touch.
+    below = [pill_size(i) for i in bottom[0]["items"]] if bottom else []
+    col_pitch = max([300] + [w + 24 for w, _ in below])
+    row_pitch = max([78] + [h + 16 for _, h in below])
     body = max(heights + [360])
-    height = int(TOP + body + (140 + rows * 78 + 60 if bottom else 60) + 80)
+    height = int(TOP + body + (140 + rows * row_pitch + 60 if bottom else 60) + 80)
     widest = max([pill_size(i)[0] for g in groups for i in g["items"]] + [200])
-    width = int(max(1800, 2 * (RX + PILL_OFFSET + widest + 60)))
+    width = int(max(1800, 2 * (RX + PILL_OFFSET + widest + 60), 3 * col_pitch + 120))
     cx, cy = width / 2, TOP + body / 2
 
     placed, pills = [], []
@@ -217,8 +245,8 @@ def layout(spec):
             r, c = divmod(idx, 3)
             cnt = min(3, k - r * 3)
             w, h = pill_size(it)
-            px = gx + (c - (cnt - 1) / 2) * 300
-            py = gy + 100 + r * 78
+            px = gx + (c - (cnt - 1) / 2) * col_pitch
+            py = gy + 60 + row_pitch / 2 + r * row_pitch
             pills.append({"item": it, "group": g, "x": px - w / 2, "y": py - h / 2, "w": w, "h": h, "side": 0, "gx": gx, "gy": gy})
     return {"width": width, "height": height, "cx": cx, "cy": cy, "groups": placed, "pills": pills}
 
@@ -318,9 +346,13 @@ def svg(spec):
     return "\n".join(out) + "\n"
 
 
+def html_page(title, body):
+    return (f'<!doctype html><html><head><meta charset="utf-8"><title>{esc(title)}</title>'
+            f'<link rel="stylesheet" href="{FONTS}"></head><body style="margin:0;background:#f7f5ef">{body}</body></html>\n')
+
+
 def page(spec):
-    return (f'<!doctype html><html><head><meta charset="utf-8"><title>{esc(spec["title"])} feature map</title>'
-            f'<link rel="stylesheet" href="{FONTS}"></head><body style="margin:0;background:#f7f5ef">{svg(spec)}</body></html>\n')
+    return html_page(f"{spec['title']} feature map", svg(spec))
 
 
 def mermaid(spec):
@@ -349,16 +381,18 @@ def mermaid(spec):
 def write_output(body, width, height, title, output):
     """svg, html or png, by the output's extension; svg to stdout without one."""
     fmt = Path(output).suffix.lstrip(".") if output else "svg"
-    html_page = (f'<!doctype html><html><head><meta charset="utf-8"><title>{esc(title)}</title>'
-                 f'<link rel="stylesheet" href="{FONTS}"></head><body style="margin:0;background:#f7f5ef">{body}</body></html>\n')
+    if fmt not in ("svg", "html", "png"):
+        print(f"feature-map: a stack is drawn as .svg, .html or .png, not {Path(output).suffix or 'no extension'}", file=sys.stderr)
+        return 2
+    wrapped = html_page(title, body)
     if fmt == "png":
         try:
-            screenshot(html_page, width, height, output)
+            screenshot(wrapped, width, height, output)
         except (RuntimeError, subprocess.TimeoutExpired) as exc:
             print(f"feature-map: {exc}", file=sys.stderr)
             return 3
         return 0
-    text = html_page if fmt == "html" else body
+    text = wrapped if fmt == "html" else body
     if output:
         Path(output).write_text(text, encoding="utf-8")
     else:
@@ -367,9 +401,15 @@ def write_output(body, width, height, title, output):
 
 
 def browser():
-    found = os.environ.get("FEATURE_MAP_BROWSER")
-    for name in ([found] if found else []) + ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"]:
-        path = shutil.which(name) if name else None
+    named = os.environ.get("FEATURE_MAP_BROWSER")
+    if named:
+        # Asked for by name, so a missing one is an error, not a quiet fallback.
+        path = shutil.which(named)
+        if not path:
+            raise RuntimeError(f"FEATURE_MAP_BROWSER names {named!r}, which is not an executable on PATH")
+        return path
+    for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable"):
+        path = shutil.which(name)
         if path:
             return path
     return None
@@ -380,6 +420,8 @@ def screenshot(html_page, width, height, out):
     if not exe:
         raise RuntimeError("png needs a Chromium-based browser on PATH, or FEATURE_MAP_BROWSER set")
     out = Path(out).resolve()
+    # An old picture left from an earlier run must not pass for this one.
+    out.unlink(missing_ok=True)
     # Written beside the output, not in /tmp: a sandboxed browser may not see /tmp.
     with tempfile.TemporaryDirectory(dir=out.parent, prefix=".feature-map-") as tmp:
         src = Path(tmp) / "map.html"
@@ -419,12 +461,16 @@ def read_help(text):
         if not line[0].isspace():
             # A usage, options, exit-code or environment section lists things
             # that are not commands, so everything under it is skipped.
-            skipping = line.lower().startswith(("usage", "options", "flags", "exit", "environment"))
+            heading = line.lower()
+            skipping = (heading.startswith(("usage", "flags", "exit", "environment", "example"))
+                        or "option" in heading or "optional argument" in heading)
             current = None if skipping else (line.strip().rstrip(":"), [])
             if current:
                 groups.append(current)
             continue
         if skipping:
+            continue
+        if line.lstrip().startswith("-"):
             continue
         m = HELP_CMD_RE.match(line)
         if not m:
@@ -459,7 +505,7 @@ def read_make(text):
 
 
 def read_source(kind, path):
-    text = sys.stdin.read() if path == "-" else Path(path).read_text(encoding="utf-8")
+    text = read_text(path)
     return read_help(text) if kind == "help" else read_make(text)
 
 
@@ -467,7 +513,7 @@ def draft(groups, title, source):
     """An outline to curate, never to publish as it is: every command becomes an
     item, and the person drawing the map regroups, trims and declares omissions."""
     out = [f"# {title}", "> TODO: one line on what it is for", "",
-           f"source: {source}", f"date: {__import__('datetime').date.today().isoformat()}", ""]
+           f"source: {source}", f"date: {datetime.datetime.now().astimezone().date().isoformat()}", ""]
     for heading, cmds in groups:
         out.append(f"## {heading}")
         for name, desc in cmds:
@@ -484,9 +530,8 @@ def names_on_map(spec):
     for g in spec["groups"]:
         for it in g["items"]:
             if it.get("head"):
-                for part in re.split(r",\s*|\s+and\s+|\|", it["head"]):
-                    if part.strip():
-                        covered.add(part.strip().lower())
+                for part in re.split(r",\s*|\s+and\s+", it["head"]):
+                    covered.update(alternatives(part.strip().lower()))
     return covered
 
 
@@ -512,9 +557,15 @@ def drift(spec, groups):
     shown = names_on_map(spec)
     omitted = {o.strip().lower() for o in spec.get("omit", [])}
     missing = sorted(n for n in source if n not in shown and n not in omitted and source[n].lower() not in omitted)
-    planned = {p.strip().lower() for g in spec["groups"] for it in g["items"] if it.get("head") and (g["planned"] or it.get("planned"))
-               for p in re.split(r",\s*|\s+and\s+|\|", it["head"])}
-    stale = sorted(n for n in shown if n not in source and n not in planned and not any(n in full.lower() for full in source.values()))
+    planned = {a for g in spec["groups"] for it in g["items"] if it.get("head") and (g["planned"] or it.get("planned"))
+               for p in re.split(r",\s*|\s+and\s+", it["head"]) for a in alternatives(p.strip().lower())}
+
+    def still_there(n):
+        # A name on the map may be a whole command or its first or last words:
+        # 'scale' covers 'scale up'. It never matches inside a word, so a
+        # removed 'up' is not hidden by 'update'.
+        return any(k == n or k.startswith(n + " ") or k.endswith(" " + n) for k in source)
+    stale = sorted(n for n in shown if n not in planned and not still_there(n))
     return missing, stale
 
 
@@ -564,6 +615,8 @@ def read_compose(text, label=None):
     A dependency that waits for another service to finish is kept apart from
     the rest as `after`: it is start order, not a path a request takes."""
     c = json.loads(text)
+    if not isinstance(c, dict):
+        raise SpecError("that is not a Compose configuration: expected an object with services")
     services = c.get("services") or {}
     if not services:
         raise SpecError("no services in that Compose configuration")
@@ -579,9 +632,19 @@ def read_compose(text, label=None):
                      "label": key if generated else plain(name),
                      "joins": set() if generated else join_keys(name)}
     out = {}
+    modes = {}
     for name, svc in services.items():
         svc_nets = svc.get("networks")
-        svc_nets = list(svc_nets.keys()) if isinstance(svc_nets, dict) else (svc_nets or ["default"])
+        svc_nets = (list(svc_nets.keys()) if isinstance(svc_nets, dict) else svc_nets) or ["default"]
+        # network_mode replaces networks: the host's own, none at all, or
+        # another service's. Compose prints no networks key for these.
+        mode = str(svc.get("network_mode") or "")
+        if mode.startswith(("service:", "container:")):
+            modes[name] = mode.split(":", 1)[1]
+        elif mode in ("host", "none"):
+            # Not a network Compose owns, so it never becomes a box: the card
+            # says it, and the service stays in the box its profile gives it.
+            svc_nets = []
         vols = []
         for v in svc.get("volumes") or []:
             if isinstance(v, dict) and v.get("type") == "volume" and v.get("source"):
@@ -600,7 +663,13 @@ def read_compose(text, label=None):
             "health": "healthcheck" in svc and not (svc["healthcheck"] or {}).get("disable"),
             "profiles": svc.get("profiles") or [],
             "members": [name],
+            "mode": {"host": "host network", "none": "no network"}.get(mode, ""),
         }
+    for name, other in modes.items():
+        # Sharing another container's network puts a service wherever that one is.
+        if other in out:
+            out[name]["networks"] = list(out[other]["networks"])
+            out[name]["mode"] = out[other]["mode"]
     return {"name": label or project, "services": out, "networks": nets}
 
 
@@ -620,19 +689,25 @@ def collapse(svcs):
         key = (n.split("-")[0], s["image"], tuple(s["networks"]), tuple(s["volumes"]), tuple(s["depends"]),
                tuple(s["after"]), s["health"], tuple(s["profiles"]))
         groups.setdefault(key, []).append(n)
-    first = {names[0]: names for names in groups.values() if len(names) >= 3}
+    def folded(names):
+        common = []
+        for part in zip(*(m.split("-") for m in names)):
+            if len(set(part)) > 1:
+                break
+            common.append(part[0])
+        return "-".join(common) + "-*"
+    candidates = [names for names in groups.values() if len(names) >= 3]
+    counts = {}
+    for names in candidates:
+        counts[folded(names)] = counts.get(folded(names), 0) + 1
+    # Two groups that would fold to one name are both drawn in full, so no
+    # service ever disappears behind another group's card.
+    first = {names[0]: names for names in candidates if counts[folded(names)] == 1 and folded(names) not in svcs}
     dropped = {n for names in first.values() for n in names}
     out = {}
     for n, s in svcs.items():
         if n in first:
-            names = first[n]
-            words = [m.split("-") for m in names]
-            common = []
-            for part in zip(*words):
-                if len(set(part)) > 1:
-                    break
-                common.append(part[0])
-            out["-".join(common) + "-*"] = dict(s, members=list(names))
+            out[folded(first[n])] = dict(s, members=list(first[n]))
         elif n not in dropped:
             out[n] = s
     return out
@@ -642,6 +717,8 @@ def home_network(svc, nets):
     """The box a service is drawn in: the first network its own project owns.
     An external network it joins belongs to someone else, even when its name
     sorts first."""
+    if not svc["networks"]:
+        return None
     owned = [k for k in svc["networks"] if not nets.get(k, {}).get("external")]
     return owned[0] if owned else svc["networks"][0]
 
@@ -678,11 +755,21 @@ def stack_columns(names, svcs):
              and any(n in svcs[m]["depends"] and len([d for d in svcs[m]["depends"] if d in leaves]) >= 2 for m in names)]
     for n in sinks:
         depth.pop(n, None)
+    # A service off the path joins a volume mate's column. Up to five with no
+    # mate at all stand in a row after the path; more go into columns of five,
+    # so a stack with no depends_on is a block rather than a long strip.
+    base = max(depth.values(), default=-1) + 1
+    lonely = [n for n in names if n not in depth and n not in sinks
+              and not [m for m in depth if set(svcs[m]["volumes"]) & set(svcs[n]["volumes"])]]
+    per = 1 if len(lonely) <= 5 else 5
     for n in names:
         if n in depth or n in sinks:
             continue
-        mates = [m for m in depth if set(svcs[m]["volumes"]) & set(svcs[n]["volumes"])]
-        depth[n] = max((depth[m] for m in mates), default=max(depth.values(), default=-1) + 1)
+        if n in lonely:
+            depth[n] = base + lonely.index(n) // per
+        else:
+            mates = [m for m in depth if set(svcs[m]["volumes"]) & set(svcs[n]["volumes"])]
+            depth[n] = max(depth[m] for m in mates)
     cols = {}
     for n in names:
         if n not in sinks:
@@ -737,12 +824,19 @@ def stack_svg(projects, title, subtitle, source, date):
     if isinstance(projects, dict):
         projects = [projects]
     multi = len(projects) > 1
+    folded = [collapse(p["services"]) for p in projects]
+    seen = {}
+    for f in folded:
+        for n in f:
+            seen[n] = seen.get(n, 0) + 1
     svcs = {}
-    for pi, p in enumerate(projects):
-        for n, s in collapse(p["services"]).items():
-            if n in svcs:
-                raise SpecError(f"{n} is a service in two of these projects; draw them separately")
-            svcs[n] = dict(s, project=pi)
+    for pi, (p, f) in enumerate(zip(projects, folded)):
+        # Two projects may both have a db; Compose keeps them apart by project,
+        # and so does the drawing, by naming each after its project.
+        rename = {n: f"{p['name']}/{n}" for n in f if seen[n] > 1}
+        for n, s in f.items():
+            svcs[rename.get(n, n)] = dict(s, project=pi, depends=[rename.get(d, d) for d in s["depends"]],
+                                          after=[rename.get(d, d) for d in s["after"]])
 
     # An external network one project joins and another declares, matched on
     # the variable or the name that sets it.
@@ -760,7 +854,7 @@ def stack_svg(projects, title, subtitle, source, date):
     joined = {(pi, k) for pi, k, _, _ in joins}
     for s in svcs.values():
         nets = projects[s["project"]]["networks"]
-        s["outside"] = [nets[k]["label"] for k in s["networks"]
+        s["outside"] = ([s["mode"]] if s["mode"] else []) + [nets[k]["label"] for k in s["networks"]
                         if nets.get(k, {}).get("external") and (s["project"], k) not in joined]
 
     boxes, lede = [], ""
@@ -772,7 +866,7 @@ def stack_svg(projects, title, subtitle, source, date):
         oneshot = {d for n in mine for d in svcs[n]["after"]} - {d for n in mine for d in svcs[n]["depends"]}
         rest = [n for n in mine if n not in oneshot]
         home = {n: home_network(svcs[n], nets) for n in rest}
-        homes = list(dict.fromkeys(home.values()))
+        homes = [h for h in dict.fromkeys(home.values()) if h is not None]
         pre = f"{p['name']} · " if multi else ""
         these = []
         if len(homes) > 1:
@@ -780,6 +874,9 @@ def stack_svg(projects, title, subtitle, source, date):
                 net = nets.get(h, {})
                 these.append({"label": pre + "network: " + net.get("label", h), "names": [n for n in rest if home[n] == h],
                               "dashed": net.get("external", False), "path": True, "net": h})
+            for mode in sorted({svcs[n]["mode"] for n in rest if home[n] is None}):
+                these.append({"label": pre + mode, "names": [n for n in rest if home[n] is None and svcs[n]["mode"] == mode],
+                              "dashed": False, "path": True, "net": None})
         else:
             h = homes[0] if homes else None
             these.append({"label": pre + "always running", "names": [n for n in rest if not svcs[n]["profiles"]],
@@ -787,8 +884,10 @@ def stack_svg(projects, title, subtitle, source, date):
             for prof in sorted({pr for n in rest for pr in svcs[n]["profiles"]}):
                 these.append({"label": pre + f"opt-in profile: {prof}", "dashed": True, "path": False, "net": h,
                               "names": [n for n in rest if svcs[n]["profiles"] and svcs[n]["profiles"][0] == prof]})
-            if not multi and h:
-                lede = f"Everything here lives on one network ({nets.get(h, {}).get('label', h)}), so the boxes say when a service runs."
+            if not multi:
+                where = f"one network ({nets.get(h, {}).get('label', h)})" if h else "the host's network"
+                if h or all(svcs[n]["mode"] == "host network" for n in rest):
+                    lede = f"Everything here lives on {where}, so the boxes say when a service runs."
         these.append({"label": pre + "runs once, before the rest", "names": [n for n in mine if n in oneshot],
                       "dashed": False, "path": False, "net": None})
         these = [b for b in these if b["names"]]
@@ -811,7 +910,7 @@ def stack_svg(projects, title, subtitle, source, date):
         shown = [n + (f" ({count_badge(svcs[n])})" if count_badge(svcs[n]) else "") for n in users]
         listed = ", ".join(shown[:-1]) + " and " + shown[-1] if len(shown) > 1 else shown[0]
         dst = box_for(qi, k2)
-        dst["note"] = f"Reached from {projects[pi]['name']} over its {k} network, by {listed}."
+        dst.setdefault("notes", []).append(f"Reached from {projects[pi]['name']} over its {k} network, by {listed}.")
         links.append((box_for(pi), dst))
 
     pos, frame_of, buses = {}, {}, []
@@ -829,10 +928,11 @@ def stack_svg(projects, title, subtitle, source, date):
             cols, sinks = [names[i::per] for i in range(per)], []
         widths = [max(card_width(n, svcs[n]) for n in col) for col in cols]
         heights = [sum(card_height(svcs[n]) + CARD_GAP for n in col) - CARD_GAP for col in cols]
-        head = 60 + (26 if b.get("note") else 0)
+        notes = b.get("notes", [])
+        head = 60 + 22 * len(notes) + (4 if notes else 0)
         bw = sum(widths) + (len(cols) - 1) * COL_GAP + 80
-        if b.get("note"):
-            bw = max(bw, int(len(b["note"]) * SMALL_CHAR_W + 60))
+        for note in notes:
+            bw = max(bw, int(len(note) * SMALL_CHAR_W + 60))
         bh = max(heights) + head + 30
         if b["path"]:
             if row_h:
@@ -949,8 +1049,11 @@ def stack_svg(projects, title, subtitle, source, date):
            f'<text x="62" y="130" class="st">{esc(subtitle)}</text>']
 
     # The legend names only what this drawing uses.
-    keys = ['<path d="M0,{c} L34,{c}" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)"/>|depends on',
-            '<rect x="0" y="{t}" width="34" height="16" rx="4" fill="#7c3aed" fill-opacity=".16"/>|same colour: a volume shared between services']
+    keys = []
+    if any(d in pos for s in svcs.values() for d in s["depends"]):
+        keys.append('<path d="M0,{c} L34,{c}" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)"/>|depends on')
+    if vol_colors:
+        keys.append('<rect x="0" y="{t}" width="34" height="16" rx="4" fill="#7c3aed" fill-opacity=".16"/>|same colour: a volume shared between services')
     dashed_box = '<rect x="0" y="{t}" width="34" height="18" rx="6" fill="none" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6 4"/>|'
     if any(b["dashed"] and b["label"].split("· ")[-1].startswith("opt-in") for b in boxes):
         keys.append(dashed_box + "runs only when its profile is asked for")
@@ -959,10 +1062,11 @@ def stack_svg(projects, title, subtitle, source, date):
     if links:
         keys.append('<path d="M0,{c} L34,{c}" stroke="#475569" stroke-width="2.4" stroke-dasharray="8 5"/>|a network one project declares and another joins')
     if any(s["outside"] for s in svcs.values()):
-        keys.append('<rect x="0" y="{t}" width="34" height="18" rx="9" fill="none" stroke="#64748b" stroke-width="1.3" stroke-dasharray="4 3"/>|joins a network this drawing does not show')
+        keys.append('<rect x="0" y="{t}" width="34" height="18" rx="9" fill="none" stroke="#64748b" stroke-width="1.3" stroke-dasharray="4 3"/>|on a network this drawing does not show')
     if any(len(s["members"]) > 1 for s in svcs.values()):
         keys.append('<text x="17" y="{b}" text-anchor="middle" class="tag" fill="#334155">×N</text>|N services alike but for their names, drawn once')
-    keys.append('<circle cx="17" cy="{c}" r="5" fill="#16a34a"/>|has a health check')
+    if any(s["health"] for s in svcs.values()):
+        keys.append('<circle cx="17" cy="{c}" r="5" fill="#16a34a"/>|has a health check')
     legend = []
     for i, k in enumerate(keys):
         mark, text = k.split("|", 1)
@@ -975,8 +1079,8 @@ def stack_svg(projects, title, subtitle, source, date):
         bx, by, bw, bh = b["frame"]
         out.append(f'<rect x="{bx}" y="{by}" width="{bw}" height="{bh}" rx="22" fill="{"none" if b["dashed"] else "#ffffff"}" fill-opacity=".55" stroke="#94a3b8" stroke-width="1.6"{dash(b["dashed"], "8 6")}/>')
         out.append(f'<text x="{bx + 24}" y="{by + 32}" class="bl" fill="#64748b">{esc(b["label"].upper())}</text>')
-        if b.get("note"):
-            out.append(f'<text x="{bx + 24}" y="{by + 56}" class="bn">{esc(b["note"])}</text>')
+        for i, note in enumerate(b.get("notes", [])):
+            out.append(f'<text x="{bx + 24}" y="{by + 56 + 22 * i}" class="bn">{esc(note)}</text>')
     out += edges
     for n, (x, yy, w, h, dashed) in pos.items():
         svc = svcs[n]
@@ -1024,6 +1128,10 @@ def stack_svg(projects, title, subtitle, source, date):
 
 # --- command line ------------------------------------------------------------
 
+# Input that is read but cannot be drawn: exit 1, like any refused outline.
+REFUSED = (SpecError, json.JSONDecodeError, UnicodeDecodeError)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="feature-map", description="Draw what a tool does as one picture.")
     ap.add_argument("--version", action="version", version=f"feature-map {VERSION}")
@@ -1053,14 +1161,18 @@ def main(argv=None):
     k.add_argument("--date", default="")
     args = ap.parse_args(argv)
 
+    out = getattr(args, "output", None)
+    if out and not Path(out).resolve().parent.is_dir():
+        print(f"feature-map: no such directory for {out!r}", file=sys.stderr)
+        return 2
+
     if args.cmd == "stack":
         projects = []
         for arg in args.source:
             label, path = arg.split("=", 1) if "=" in arg and not Path(arg).exists() else ("", arg)
             try:
-                text = sys.stdin.read() if path == "-" else Path(path).read_text(encoding="utf-8")
-                projects.append(read_compose(text, label or None))
-            except (SpecError, json.JSONDecodeError) as exc:
+                projects.append(read_compose(read_text(path), label or None))
+            except REFUSED as exc:
                 print(f"feature-map: {path}: {exc}", file=sys.stderr)
                 return 1
             except OSError as exc:
@@ -1077,6 +1189,9 @@ def main(argv=None):
     if args.cmd == "draft":
         try:
             groups = read_source(args.kind, args.source)
+        except UnicodeDecodeError as exc:
+            print(f"feature-map: {args.source}: not UTF-8 text: {exc}", file=sys.stderr)
+            return 1
         except OSError as exc:
             print(f"feature-map: {exc}", file=sys.stderr)
             return 2
@@ -1089,7 +1204,7 @@ def main(argv=None):
 
     try:
         spec = load(args.spec)
-    except (SpecError, json.JSONDecodeError) as exc:
+    except REFUSED as exc:
         print(f"feature-map: {args.spec}: {exc}", file=sys.stderr)
         return 1
     except OSError as exc:
@@ -1098,6 +1213,9 @@ def main(argv=None):
     if args.cmd == "drift":
         try:
             groups = read_source(args.kind, args.source)
+        except UnicodeDecodeError as exc:
+            print(f"feature-map: {args.source}: not UTF-8 text: {exc}", file=sys.stderr)
+            return 1
         except OSError as exc:
             print(f"feature-map: {exc}", file=sys.stderr)
             return 2

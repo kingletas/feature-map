@@ -59,6 +59,16 @@ class Outline(unittest.TestCase):
         self.assertEqual(s["groups"][0]["items"][0], {"head": "open", "text": "open a file", "planned": False})
         self.assertEqual(s["groups"][1]["items"][1]["text"], "a plain item with no head")
 
+    def test_bold_text_without_a_colon_is_prose_not_a_name(self):
+        s = spec_from(OUTLINE.replace("- a plain item with no head", "- **Always** backs up first"))
+        self.assertNotIn("head", s["groups"][1]["items"][1])
+
+    def test_a_byte_order_mark_does_not_hide_the_title(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "t.md"
+            p.write_bytes(b"\xef\xbb\xbf" + OUTLINE.encode())
+            self.assertEqual(fm.load(p)["title"], "Tinytool")
+
     def test_an_item_can_be_planned_on_its_own(self):
         s = spec_from(OUTLINE.replace("- **peek**: the first lines", "- **peek**: the first lines [planned]"))
         self.assertTrue(s["groups"][0]["items"][1]["planned"])
@@ -83,6 +93,18 @@ class Refusals(unittest.TestCase):
     def test_an_empty_group_is_refused(self):
         with self.assertRaisesRegex(fm.SpecError, "no items"):
             spec_from(OUTLINE + "\n## Empty\n")
+
+    def test_an_unknown_setting_is_refused_rather_than_absorbed(self):
+        with self.assertRaisesRegex(fm.SpecError, "not a setting"):
+            spec_from(OUTLINE.replace("source: the Tinytool help", "sorce: the Tinytool help\nsource: x"))
+
+    def test_the_same_bold_name_twice_is_refused_however_it_is_described(self):
+        with self.assertRaisesRegex(fm.SpecError, "twice"):
+            spec_from(OUTLINE.replace("- undo", "- **save**: keep a copy"))
+
+    def test_a_json_group_with_no_name_is_refused(self):
+        with self.assertRaisesRegex(fm.SpecError, "no name"):
+            fm.normalise({"title": "T", "source": "s", "groups": [{"items": ["a"]}]})
 
     def test_a_stray_line_inside_a_group_is_an_error_not_ignored(self):
         with self.assertRaisesRegex(fm.SpecError, "line"):
@@ -110,6 +132,10 @@ class Layout(unittest.TestCase):
             self.assertGreaterEqual(p["x"], 0)
             self.assertLessEqual(p["x"] + p["w"], geo["width"])
 
+
+    def test_long_planned_items_under_the_centre_never_touch(self):
+        long = "".join(f"- **a much longer planned feature name {i}**: " + "a description that runs on " * 4 + "\n" for i in range(5))
+        self.check_no_overlap(spec_from("# Later\nsource: a test\n## Now\n- one\n## Later [planned]\n" + long))
 
     def test_columns_are_balanced_by_height_not_count(self):
         tall = "".join(f"- **t{i}**: item\n" for i in range(9))
@@ -143,6 +169,13 @@ lint:
 
 
 class Sources(unittest.TestCase):
+    def test_options_and_examples_are_never_commands(self):
+        text = ("Commands:\n  open FILE   Open it\n\nGlobal Options:\n  --config PATH   Where\n\n"
+                "optional arguments:\n  -h, --help   Help\n\nExamples:\n  tinytool open notes.txt\n\n"
+                "More:\n  -v, --verbose   Louder\n  save   Write\n")
+        names = [n for _, cmds in fm.read_help(text) for n, _ in cmds]
+        self.assertEqual(names, ["open", "save"])
+
     def test_help_text_is_read_under_its_own_headings(self):
         groups = fm.read_help(HELP)
         self.assertEqual([h for h, _ in groups], ["Reading", "Writing"])
@@ -166,6 +199,17 @@ class Sources(unittest.TestCase):
 
 
 class Drift(unittest.TestCase):
+    def test_a_fresh_draft_has_not_drifted_from_its_own_source(self):
+        drafted = fm.draft(fm.read_help(HELP), "Tinytool", "its help")
+        self.assertEqual(fm.drift(spec_from(drafted), fm.read_help(HELP)), ([], []))
+
+    def test_a_removed_short_command_is_not_hidden_by_a_longer_one(self):
+        m = spec_from("# T\nsource: s\n## G\n- **up**: start\n- **clean**: tidy\n- **scale**: resize\n")
+        help_text = "Commands\n  update   Update\n  cleanup   Tidy\n  scale grow   Grow\n"
+        missing, stale = fm.drift(m, fm.read_help(help_text))
+        self.assertEqual(stale, ["clean", "up"])
+        self.assertEqual(missing, ["cleanup", "scale grow", "update"])
+
     MAP = """# Tinytool
 source: tinytool --help
 omit: sync pull
@@ -217,7 +261,15 @@ class Stack(unittest.TestCase):
         m = self.model()
         self.assertEqual(m["services"]["db"]["ports"], ["3306 \u2192 3306"])
         self.assertEqual(fm.plain("${DB_PASSWORD}"), "$DB_PASSWORD")
-        self.assertNotIn("DB_PASSWORD", fm.stack_svg(m, "T", "", "a test", "")[0].replace("$DB_PASSWORD", ""))
+
+    def test_environment_is_never_drawn(self):
+        c = json.loads(SHOP.read_text())
+        c["services"]["db"]["environment"] = {"INVENTED_SETTING": "value-never-drawn-7f3a"}
+        c["services"]["db"]["image"] = "mariadb:${DB_TAG}"
+        svg = fm.stack_svg(fm.read_compose(json.dumps(c)), "T", "", "a test", "")[0]
+        self.assertNotIn("value-never-drawn-7f3a", svg)
+        self.assertNotIn("INVENTED_SETTING", svg)
+        self.assertIn("mariadb:$DB_TAG", svg)
 
     def test_columns_follow_the_request_path_and_data_goes_last(self):
         m = self.model()
@@ -246,6 +298,10 @@ class Stack(unittest.TestCase):
     def test_three_arrows_into_the_data_become_one_into_its_bus(self):
         svg, _, _ = fm.stack_svg(self.model(), "T", "", "a test", "")
         self.assertEqual(svg.count('stroke-width="3" stroke-linecap="round"'), 1, "one bus for the data column")
+        # proxy->cache, cache->app, app->bus, worker->bus, worker->app, three
+        # stubs off the bus, and the legend's own arrow. Without the bus, app
+        # and worker would draw three arrows each into the data column.
+        self.assertEqual(svg.count('marker-end="url(#arr)"'), 9)
 
     def test_the_same_stack_draws_the_same_svg_every_run(self):
         runs = {subprocess.run([sys.executable, str(TOOL), "stack", str(SHOP)], capture_output=True, text=True,
@@ -347,10 +403,50 @@ class TwoProjects(unittest.TestCase):
     def test_alone_the_joined_network_is_named_on_the_cards_instead(self):
         self.assertIn(">$DATA_NET<", self.draw(SITE))
 
-    def test_one_service_name_in_two_projects_is_refused(self):
-        clash = dict(DATA, services={"engine": svc()})
-        with self.assertRaises(fm.SpecError):
-            self.draw(SITE, clash)
+    def test_one_service_name_in_two_projects_is_drawn_twice_by_project(self):
+        out = self.draw(SITE, dict(DATA, services={"engine": svc(), "store": svc()}))
+        self.assertIn(">site/engine<", out)
+        self.assertIn(">data/engine<", out)
+        self.assertIn(">store<", out)
+
+    def test_every_project_that_joins_a_network_is_named_on_it(self):
+        admin = dict(SITE, name="admin", services={"panel": svc(networks={"data": {}})})
+        out = self.draw(SITE, admin, DATA)
+        self.assertIn("Reached from site over its data network", out)
+        self.assertIn("Reached from admin over its data network, by panel.", out)
+
+    def test_two_groups_that_would_fold_to_one_name_are_both_drawn_in_full(self):
+        one = {n: svc(image="a:1") for n in ("queue-orders", "queue-mail", "queue-feeds")}
+        two = {n: svc(image="b:1") for n in ("queue-audit", "queue-search", "queue-billing")}
+        drawn = fm.collapse(fm.read_compose(json.dumps({"name": "x", "services": {**one, **two}}))["services"])
+        self.assertEqual(len(drawn), 6)
+
+    def test_host_networking_is_not_called_the_default_network(self):
+        c = {"name": "x", "services": {"a": svc(network_mode="host"), "b": svc(network_mode="service:a")}}
+        m = fm.read_compose(json.dumps(c))
+        self.assertEqual(m["services"]["b"]["networks"], m["services"]["a"]["networks"])
+        out = self.draw(c)
+        self.assertIn("lives on the host&#x27;s network", out)
+        self.assertNotIn("(default)", out)
+        self.assertEqual(out.count(">host network<"), 2, "each card says so")
+
+    def test_host_networking_keeps_a_service_in_its_profile_box(self):
+        c = {"name": "x", "services": {"web": svc(ports=["80:80"], depends_on={"db": {}}), "db": svc(),
+                                       "tool": svc(network_mode="host", profiles=["tools"])}}
+        out = self.draw(c)
+        self.assertIn("OPT-IN PROFILE: TOOLS", out)
+        self.assertNotIn("NETWORK:", out)
+
+    def test_services_with_no_connections_make_a_block_not_a_strip(self):
+        c = {"name": "x", "services": {f"s{i:02}": svc() for i in range(12)}}
+        m = fm.read_compose(json.dumps(c))
+        cols, _ = fm.stack_columns(list(m["services"]), m["services"])
+        self.assertEqual([len(col) for col in cols], [5, 5, 2])
+
+    def test_the_legend_names_only_what_is_drawn(self):
+        out = self.draw({"name": "x", "services": {"a": svc(), "b": svc()}})
+        for absent in ("depends on", "a volume shared", "health check"):
+            self.assertNotIn(absent, out)
 
     def test_a_long_name_widens_its_card(self):
         long = {"name": "x", "services": {"a-service-with-a-very-long-descriptive-name": svc()}}
@@ -365,6 +461,18 @@ class Drawing(unittest.TestCase):
         out = fm.svg(s)
         self.assertIn("open &lt;b&gt;&amp;&lt;/b&gt; a file", out)
         self.assertNotIn("<b>", out)
+
+    def test_a_colour_that_is_not_hex_is_refused_before_it_reaches_an_attribute(self):
+        base = {"title": "T", "source": "s", "groups": [{"name": "G", "items": ["one"]}]}
+        attack = 'red"/><script>alert(1)</script><text x="'
+        for colour in (attack, "red", "#12345"):
+            spec = json.loads(json.dumps(base))
+            spec["groups"][0]["color"] = colour
+            with self.assertRaises(fm.SpecError, msg=colour):
+                fm.normalise(spec)
+        spec = json.loads(json.dumps(base))
+        spec["groups"][0]["color"] = "#0d9488"
+        self.assertIn('fill="#0d9488"', fm.svg(fm.normalise(spec)))
 
     def test_the_source_is_printed_on_the_map(self):
         self.assertIn("DRAWN FROM THE TINYTOOL HELP", fm.svg(spec_from(OUTLINE)))
@@ -405,6 +513,44 @@ class CommandLine(unittest.TestCase):
 
     def test_a_missing_file_exits_2(self):
         self.assertEqual(self.run_tool("check", "/nonexistent/outline.md").returncode, 2)
+
+    def test_input_that_is_read_but_cannot_be_drawn_exits_1_without_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cases = {"list.json": b"[]", "latin.md": "# Caf\u00e9\nsource: s\n## G\n- a\n".encode("latin-1"),
+                     "noname.json": json.dumps({"title": "T", "source": "s", "groups": [{"items": ["a"]}]}).encode()}
+            for name, data in cases.items():
+                (Path(tmp) / name).write_bytes(data)
+                r = self.run_tool("check", str(Path(tmp) / name))
+                self.assertEqual(r.returncode, 1, name)
+                self.assertNotIn("Traceback", r.stderr, name)
+            (Path(tmp) / "null.json").write_text("null")
+            r = self.run_tool("stack", str(Path(tmp) / "null.json"))
+            self.assertEqual((r.returncode, "Traceback" in r.stderr), (1, False))
+
+    def test_an_output_folder_that_does_not_exist_exits_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "t.md"
+            p.write_text(OUTLINE)
+            for args in (("render", str(p)), ("stack", str(SHOP))):
+                r = self.run_tool(*args, "-o", str(Path(tmp) / "missing" / "out.svg"))
+                self.assertEqual((r.returncode, "Traceback" in r.stderr), (2, False), args)
+
+    def test_a_stack_refuses_an_extension_it_cannot_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for ext in ("txt", "mmd"):
+                r = self.run_tool("stack", str(SHOP), "-o", str(Path(tmp) / f"out.{ext}"))
+                self.assertEqual(r.returncode, 2, ext)
+                self.assertFalse((Path(tmp) / f"out.{ext}").exists())
+
+    def test_a_named_browser_that_is_missing_is_an_error_not_a_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "t.md"
+            p.write_text(OUTLINE)
+            r = subprocess.run([sys.executable, str(TOOL), "render", str(p), "-o", str(Path(tmp) / "o.png")],
+                               capture_output=True, text=True, check=False,
+                               env={"PATH": "/usr/bin:/bin", "FEATURE_MAP_BROWSER": "no-such-browser-here"})
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("no-such-browser-here", r.stderr)
 
     def test_format_follows_the_extension(self):
         with tempfile.TemporaryDirectory() as tmp:

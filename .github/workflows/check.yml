@@ -17,5 +17,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-      - name: Compile and test
+        with:
+          persist-credentials: false
+      # make check lints only when ruff is installed, so the runner installs it.
+      - name: Install the linter
+        run: pipx install ruff
+      - name: Compile, lint and test
         run: make check
