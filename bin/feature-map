@@ -13,6 +13,8 @@ map with no source is refused, and so is one that names the same feature twice.
 Usage:
     feature-map render SPEC [-o OUT] [--format svg|html|png|mermaid]
     feature-map check SPEC          validate the outline and print what it holds
+    feature-map draft help|make SOURCE --title T    draft an outline from help text or a Makefile
+    feature-map drift SPEC help|make SOURCE         what the tool has that the map does not show
     feature-map --version
 
 SPEC is a Markdown outline (see docs/format.md) or the same thing as JSON.
@@ -20,7 +22,11 @@ Without -o, svg and mermaid go to stdout. The format follows OUT's extension
 unless --format says otherwise. png needs a Chromium-based browser on PATH, or
 its path in FEATURE_MAP_BROWSER.
 
-Exit codes: 0 done, 1 the outline is invalid, 2 bad usage, 3 png failed.
+SOURCE is a file, or - to read standard input: `mytool --help | feature-map
+draft help - --title Mytool`. Nothing is ever run on your behalf.
+
+Exit codes: 0 done (drift: nothing drifted), 1 the outline is invalid or has
+drifted, 2 bad usage, 3 png failed.
 """
 
 import argparse
@@ -36,7 +42,7 @@ import tempfile
 import textwrap
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 PALETTE = ["#2563eb", "#16a34a", "#d97706", "#7c3aed", "#0d9488", "#db2777", "#4f46e5", "#ca8a04"]
 PLANNED = "#b91c1c"
@@ -138,6 +144,8 @@ def normalise(spec):
     spec.setdefault("center_sub", "")
     spec.setdefault("date", "")
     spec.setdefault("planned_label", "not done yet")
+    omit = spec.get("omit") or []
+    spec["omit"] = [o.strip() for o in (omit.split(",") if isinstance(omit, str) else omit) if o.strip()]
     lede = spec.get("lede") or []
     spec["lede"] = textwrap.wrap(" ".join(lede), 52) if isinstance(lede, list) else textwrap.wrap(lede, 52)
     return spec
@@ -363,6 +371,128 @@ def png(spec, out):
         raise RuntimeError(f"the browser did not write {out.name}: {result.stderr.strip()[-300:]}")
 
 
+# --- reading a tool's own description: draft and drift ------------------------
+
+# A help line names a command, then its description after two or more spaces:
+#   "  up                     Start everything". A deeper-indented line with no
+# gap is the previous description continuing onto the next line.
+HELP_CMD_RE = re.compile(r"^(\s{1,8})(\S(?:.*?\S)?)\s{2,}(\S.*)$")
+HELP_BARE_RE = re.compile(r"^(\s{1,8})([a-z][\w:|.-]*)((?:\s+[\[<A-Z-].*)?)$")
+MAKE_RE = re.compile(r"^([A-Za-z0-9_.-]+):[^=]*?##\s*(.+)$")
+
+
+def read_help(text):
+    """Commands grouped under the help text's own headings, in order.
+
+    Returns [(heading, [(name, description)])]. A heading is an unindented line
+    that is not a usage line; commands before any heading go under 'Commands'."""
+    groups, current, skipping = [], None, False
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        if not line[0].isspace():
+            # A usage, options, exit-code or environment section lists things
+            # that are not commands, so everything under it is skipped.
+            skipping = line.lower().startswith(("usage", "options", "flags", "exit", "environment"))
+            current = None if skipping else (line.strip().rstrip(":"), [])
+            if current:
+                groups.append(current)
+            continue
+        if skipping:
+            continue
+        m = HELP_CMD_RE.match(line)
+        if not m:
+            m2 = HELP_BARE_RE.match(line)
+            if m2 and current is not None:
+                current[1].append([command_name(m2.group(2) + m2.group(3)), ""])
+            elif current is not None and current[1]:
+                current[1][-1][1] = (current[1][-1][1] + " " + line.strip()).strip()
+            continue
+        if current is None:
+            current = ("Commands", [])
+            groups.append(current)
+        current[1].append([command_name(m.group(2)), m.group(3).strip()])
+    return [(h, [tuple(c) for c in cmds]) for h, cmds in groups if cmds]
+
+
+def command_name(usage):
+    """The command in a usage fragment: 'scale [web=N] [-y]' is 'scale'."""
+    words = []
+    for word in usage.split():
+        if word[0] in "[<-" or word.isupper() or "=" in word:
+            break
+        words.append(word)
+    return " ".join(words) or usage.split()[0]
+
+
+def read_make(text):
+    """Targets documented with a '## description' comment, the self-documenting
+    Makefile convention, under one 'Make targets' group."""
+    cmds = [(m.group(1), m.group(2).strip()) for m in map(MAKE_RE.match, text.splitlines()) if m]
+    return [("Make targets", cmds)] if cmds else []
+
+
+def read_source(kind, path):
+    text = sys.stdin.read() if path == "-" else Path(path).read_text(encoding="utf-8")
+    return read_help(text) if kind == "help" else read_make(text)
+
+
+def draft(groups, title, source):
+    """An outline to curate, never to publish as it is: every command becomes an
+    item, and the person drawing the map regroups, trims and declares omissions."""
+    out = [f"# {title}", "> TODO: one line on what it is for", "",
+           f"source: {source}", f"date: {__import__('datetime').date.today().isoformat()}", ""]
+    for heading, cmds in groups:
+        out.append(f"## {heading}")
+        for name, desc in cmds:
+            first = re.split(r"(?<=[.;,])\s", desc, maxsplit=1)[0].rstrip(".;,")
+            out.append(f"- **{name}**: {first[:1].lower() + first[1:]}" if first else f"- **{name}**")
+        out.append("")
+    return "\n".join(out)
+
+
+def names_on_map(spec):
+    """Every command a map's bold names cover. 'up and down' covers up and down;
+    'ps, logs and info' covers all three; 'node|npm' covers both."""
+    covered = set()
+    for g in spec["groups"]:
+        for it in g["items"]:
+            if it.get("head"):
+                for part in re.split(r",\s*|\s+and\s+|\|", it["head"]):
+                    if part.strip():
+                        covered.add(part.strip().lower())
+    return covered
+
+
+def alternatives(name):
+    """'scale refresh|reseed' is two commands, 'scale refresh' and 'scale
+    reseed'; 'node|npm' is 'node' and 'npm'. A '<placeholder>' is not a name."""
+    if name.startswith("<"):
+        return []
+    words = name.split()
+    last = words[-1].split("|") if words else []
+    return [" ".join(words[:-1] + [w]).strip() for w in last if w]
+
+
+def drift(spec, groups):
+    """What the source has that the map neither shows nor declares, and what the
+    map names that the source no longer has. Planned items are exempt from the
+    second list, since a planned feature is not in the source yet by definition."""
+    source = {}
+    for _, cmds in groups:
+        for name, _ in cmds:
+            for alt in alternatives(name.lower()):
+                source[alt] = name
+    shown = names_on_map(spec)
+    omitted = {o.strip().lower() for o in spec.get("omit", [])}
+    missing = sorted(n for n in source if n not in shown and n not in omitted and source[n].lower() not in omitted)
+    planned = {p.strip().lower() for g in spec["groups"] for it in g["items"] if it.get("head") and (g["planned"] or it.get("planned"))
+               for p in re.split(r",\s*|\s+and\s+|\|", it["head"])}
+    stale = sorted(n for n in shown if n not in source and n not in planned and not any(n in full.lower() for full in source.values()))
+    return missing, stale
+
+
 # --- command line ------------------------------------------------------------
 
 def main(argv=None):
@@ -375,7 +505,30 @@ def main(argv=None):
     r.add_argument("--format", choices=["svg", "html", "png", "mermaid"])
     c = sub.add_parser("check", help="validate the outline")
     c.add_argument("spec")
+    d = sub.add_parser("draft", help="draft an outline from a tool's help text or Makefile")
+    d.add_argument("kind", choices=["help", "make"])
+    d.add_argument("source", help="a file, or - for standard input")
+    d.add_argument("--title", required=True)
+    d.add_argument("--source-name", help="what the map will say it was drawn from")
+    f = sub.add_parser("drift", help="what a tool has that its map does not show, and the reverse")
+    f.add_argument("spec")
+    f.add_argument("kind", choices=["help", "make"])
+    f.add_argument("source", help="a file, or - for standard input")
     args = ap.parse_args(argv)
+
+    if args.cmd == "draft":
+        try:
+            groups = read_source(args.kind, args.source)
+        except OSError as exc:
+            print(f"feature-map: {exc}", file=sys.stderr)
+            return 2
+        if not groups:
+            print(f"feature-map: found no commands in that {args.kind} text", file=sys.stderr)
+            return 1
+        name = args.source_name or (f"its {args.kind} text" if args.source == "-" else f"{Path(args.source).name}")
+        sys.stdout.write(draft(groups, args.title, name) + "\n")
+        return 0
+
     try:
         spec = load(args.spec)
     except (SpecError, json.JSONDecodeError) as exc:
@@ -384,6 +537,22 @@ def main(argv=None):
     except OSError as exc:
         print(f"feature-map: {exc}", file=sys.stderr)
         return 2
+    if args.cmd == "drift":
+        try:
+            groups = read_source(args.kind, args.source)
+        except OSError as exc:
+            print(f"feature-map: {exc}", file=sys.stderr)
+            return 2
+        missing, stale = drift(spec, groups)
+        for n in missing:
+            print(f"not on the map: {n}")
+        for n in stale:
+            print(f"on the map, not in the source: {n}")
+        if missing or stale:
+            print(f"feature-map: {spec['title']} has drifted: {len(missing)} not shown, {len(stale)} gone. "
+                  "Add what is missing, or declare it with 'omit:'.", file=sys.stderr)
+            return 1
+        return 0
     if args.cmd == "check":
         items = sum(len(g["items"]) for g in spec["groups"])
         planned = sum(1 for g in spec["groups"] for i in g["items"] if g["planned"] or i.get("planned"))

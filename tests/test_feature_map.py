@@ -118,6 +118,93 @@ class Layout(unittest.TestCase):
         self.assertEqual(sides["Tall"], -1)
         self.assertEqual({sides["A"], sides["B"], sides["C"]}, {1}, "the three short groups share the other side")
 
+HELP = """Usage: tinytool <command> [arguments]
+
+Reading
+  open FILE        Open a file, read-only. Asks nothing
+  peek [-n N]      Show the first lines
+                   of a file, then stop
+
+Writing
+  save             Write it back
+  sync push|pull   Send or fetch changes
+  <group>:<cmd>    Any plugin command runs directly
+
+Exit codes:
+  0  done
+"""
+
+MAKEFILE = """help: ## Show this help
+\t@echo
+build: deps ## Build the thing
+lint:
+\t@ruff .
+"""
+
+
+class Sources(unittest.TestCase):
+    def test_help_text_is_read_under_its_own_headings(self):
+        groups = fm.read_help(HELP)
+        self.assertEqual([h for h, _ in groups], ["Reading", "Writing"])
+        self.assertEqual(groups[0][1][0], ("open", "Open a file, read-only. Asks nothing"))
+        self.assertEqual(groups[0][1][1], ("peek", "Show the first lines of a file, then stop"))
+        self.assertIn(("sync push|pull", "Send or fetch changes"), groups[1][1])
+
+    def test_exit_codes_and_usage_are_not_commands(self):
+        names = [n for _, cmds in fm.read_help(HELP) for n, _ in cmds]
+        self.assertNotIn("0", names)
+        self.assertFalse(any(n.lower().startswith("usage") for n in names))
+
+    def test_only_documented_make_targets_count(self):
+        self.assertEqual(fm.read_make(MAKEFILE), [("Make targets", [("help", "Show this help"), ("build", "Build the thing")])])
+
+    def test_a_draft_is_an_outline_that_loads(self):
+        text = fm.draft(fm.read_help(HELP), "Tinytool", "tinytool --help")
+        s = spec_from(text)
+        self.assertEqual(s["source"], "tinytool --help")
+        self.assertIn("TODO", text, "a draft says it is not finished")
+
+
+class Drift(unittest.TestCase):
+    MAP = """# Tinytool
+source: tinytool --help
+omit: sync pull
+## Read
+- **open and peek**: look at a file
+## Write
+- **save**: write it back
+- **sync push**: send changes
+## Later [planned]
+- **undo**: take it back
+"""
+
+    def test_a_map_that_covers_its_source_has_not_drifted(self):
+        self.assertEqual(fm.drift(spec_from(self.MAP), fm.read_help(HELP)), ([], []))
+
+    def test_a_new_command_in_the_source_is_reported(self):
+        help2 = HELP.replace("  save ", "  export           Write a copy\n  save ")
+        missing, stale = fm.drift(spec_from(self.MAP), fm.read_help(help2))
+        self.assertEqual((missing, stale), (["export"], []))
+
+    def test_a_command_the_source_dropped_is_reported_but_planned_work_is_not(self):
+        help2 = HELP.replace("  save             Write it back\n", "")
+        self.assertEqual(fm.drift(spec_from(self.MAP), fm.read_help(help2)), ([], ["save"]))
+
+    def test_an_undeclared_omission_is_drift(self):
+        self.assertEqual(fm.drift(spec_from(self.MAP.replace("omit: sync pull\n", "")), fm.read_help(HELP))[0], ["sync pull"])
+
+    def test_drift_exits_1_and_is_silent_when_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            m, h = Path(tmp) / "m.md", Path(tmp) / "h.txt"
+            m.write_text(self.MAP)
+            h.write_text(HELP)
+            clean = subprocess.run([sys.executable, str(TOOL), "drift", str(m), "help", str(h)], capture_output=True, text=True, check=False)
+            h.write_text(HELP.replace("  save ", "  export           Write a copy\n  save "))
+            loud = subprocess.run([sys.executable, str(TOOL), "drift", str(m), "help", str(h)], capture_output=True, text=True, check=False)
+        self.assertEqual((clean.returncode, clean.stdout, clean.stderr), (0, "", ""))
+        self.assertEqual(loud.returncode, 1)
+        self.assertIn("not on the map: export", loud.stdout)
+
 
 class Drawing(unittest.TestCase):
     def test_svg_escapes_what_it_draws(self):

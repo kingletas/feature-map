@@ -29,6 +29,7 @@ date: 1 March 2026
 | `date: text` | When the list was read. Printed beside the source |
 | `center: text` | The label inside the hexagon, if it should differ from the title |
 | `center-sub: a · b` | Small lines under the centre label, split on ` · ` |
+| `omit: a, b` | Commands the map leaves out on purpose, so `drift` does not report them |
 | `planned-label: text` | The legend's wording for dashed items. Default `not done yet` |
 | `## Group` | A branch. Groups are coloured in order from a fixed palette |
 | `## Group [planned]` | A branch of work that is not done, or will not be. Drawn in red and dashed. The first one sits below the centre |
@@ -59,3 +60,19 @@ The same map can be written as JSON, for a tool that generates it:
   ]
 }
 ```
+
+## Drafting from a tool, and checking a map against it
+
+A map drawn by hand drifts: the tool gains a command and nobody redraws. Two commands keep the outline honest against the tool's own description, and neither runs anything on your behalf.
+
+```bash
+mytool --help | feature-map draft help - --title Mytool --source-name "mytool --help"
+```
+
+writes an outline with one group per heading in the help text and one item per command. **It is a draft**: regroup it, shorten the descriptions, and move anything unfinished under a `[planned]` group. A Makefile whose targets carry `## description` comments works the same way with `draft make Makefile`.
+
+```bash
+mytool --help | feature-map drift mytool.md help -
+```
+
+prints nothing and exits 0 when the map and the help agree. Otherwise it lists each command the map neither shows nor names in `omit:`, and each bold name on the map the help no longer has, and exits 1. **A bold name covers every command it lists**: `**up, down and restart**` covers all three. Plain items without a bold name are descriptions, not commands, and are not checked. Run it in CI and a map can no longer fall behind its tool quietly.

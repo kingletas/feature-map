@@ -42,6 +42,16 @@ date: 1 March 2026
 
 Each `##` is a branch and each `-` is a feature. `**name**:` gives a feature a bold name. `[planned]` draws a branch or an item dashed, in red. **The full format, and what is refused, is in [docs/format.md](docs/format.md).**
 
+## Keep it true
+
+A map drawn by hand falls behind its tool. `draft` writes a first outline from the tool's own help text, and `drift` tells you when the two disagree, silently when they don't. **Neither runs anything for you**: pipe the help in.
+
+```bash
+mytool --help | feature-map drift mytool.md help -
+```
+
+Details are in [docs/format.md](docs/format.md#drafting-from-a-tool-and-checking-a-map-against-it).
+
 ## Outputs
 
 | Format | For | Needs |
@@ -68,12 +78,14 @@ prints what the outline holds, and exits 1 if it would be refused.
 | `make example` | Draw the bundled example into `local.d/` |
 | `make map SPEC=… OUT=…` | Draw one outline |
 | `make install` | Put `feature-map` in `PREFIX`, default `~/bin` |
+| `feature-map draft help -` | Draft an outline from a tool's help text on standard input |
+| `feature-map drift MAP help -` | Say what the tool has that the map doesn't show, and the reverse |
 
 **Exit codes:** 0 done, 1 the outline is refused, 2 bad usage, 3 the PNG could not be drawn.
 
 ## What it does not do
 
-- **It doesn't read your code.** The outline is written by a person, or by a tool that knows the feature list. The map is as true as the outline, which is why it prints its source.
+- **It doesn't read your code.** It reads what the tool says about itself: its help text or its Makefile. The map is as true as the outline, which is why it prints its source and why `drift` exists.
 - **The layout is automatic and fixed in style**: groups to the left and right of the centre, the first planned group below it. There's no theme option yet.
 - **Text widths are estimated**, so a pill can come out a little wide. Pills never overlap, and the tests check that on a crowded map.
 
