@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""feature-map -- draw what a tool does as one picture, from a plain outline.
+
+A tool that keeps growing is hard to hold in your head. Its README lists every
+flag, and nobody reads a README to find out what the thing is for. A feature map
+is the other view: every capability, grouped by the job it does, around the
+tool's name, with the things it does not do yet drawn in dashes beside the rest.
+
+The picture is only worth having while it is true, so the outline it is drawn
+from says where its list came from, and that source is printed on the map. A
+map with no source is refused, and so is one that names the same feature twice.
+
+Usage:
+    feature-map render SPEC [-o OUT] [--format svg|html|png|mermaid]
+    feature-map check SPEC          validate the outline and print what it holds
+    feature-map --version
+
+SPEC is a Markdown outline (see docs/format.md) or the same thing as JSON.
+Without -o, svg and mermaid go to stdout. The format follows OUT's extension
+unless --format says otherwise. png needs a Chromium-based browser on PATH, or
+its path in FEATURE_MAP_BROWSER.
+
+Exit codes: 0 done, 1 the outline is invalid, 2 bad usage, 3 png failed.
+"""
+
+import argparse
+import html
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+from pathlib import Path
+
+VERSION = "0.1.0"
+
+PALETTE = ["#2563eb", "#16a34a", "#d97706", "#7c3aed", "#0d9488", "#db2777", "#4f46e5", "#ca8a04"]
+PLANNED = "#b91c1c"
+
+# Layout constants, in SVG pixels. The character widths are estimates for the
+# fonts below; a wrong estimate makes a pill a little wide, never overlapping.
+PILL_WRAP = 34
+CHAR_W = 7.4
+HEAD_CHAR_W = 8.6
+LINE_H = 19
+PILL_PAD = 18
+PILL_GAP = 12
+GROUP_GAP = 60
+RX = 380
+PILL_OFFSET = 190
+TOP = 300
+
+
+class SpecError(ValueError):
+    """The outline cannot be drawn truthfully."""
+
+
+# --- reading the outline -----------------------------------------------------
+
+KEY_RE = re.compile(r"^([a-z][a-z-]*):\s*(.*)$")
+TAG_RE = re.compile(r"\s*\[planned\]\s*$", re.IGNORECASE)
+HEAD_RE = re.compile(r"^\*\*(.+?)\*\*:?\s*(.*)$")
+
+
+def parse_markdown(text):
+    """Turn the outline into a spec dict. Unknown lines are an error, not ignored."""
+    spec = {"lede": [], "groups": []}
+    group = None
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        if line.startswith("# "):
+            spec["title"] = line[2:].strip()
+        elif line.startswith("> "):
+            spec["subtitle"] = line[2:].strip()
+        elif line.startswith("## "):
+            name = line[3:].strip()
+            planned = bool(TAG_RE.search(name))
+            group = {"name": TAG_RE.sub("", name), "planned": planned, "items": []}
+            spec["groups"].append(group)
+        elif line.lstrip().startswith("- "):
+            if group is None:
+                raise SpecError(f"line {n}: an item before any '## group'")
+            body = line.lstrip()[2:].strip()
+            planned = bool(TAG_RE.search(body))
+            body = TAG_RE.sub("", body)
+            item = {"text": body, "planned": planned}
+            m = HEAD_RE.match(body)
+            if m:
+                item = {"head": m.group(1), "text": m.group(2), "planned": planned}
+            group["items"].append(item)
+        elif group is None and KEY_RE.match(line):
+            key, value = KEY_RE.match(line).groups()
+            spec[key.replace("-", "_")] = value.strip()
+        elif group is None:
+            spec["lede"].append(line.strip())
+        else:
+            raise SpecError(f"line {n}: not an item, a group or a setting: {line.strip()!r}")
+    return spec
+
+
+def load(path):
+    text = Path(path).read_text(encoding="utf-8")
+    spec = json.loads(text) if str(path).endswith(".json") else parse_markdown(text)
+    return normalise(spec)
+
+
+def normalise(spec):
+    """Fill defaults and refuse a map that would not be true."""
+    if not spec.get("title"):
+        raise SpecError("the outline has no '# title'")
+    if not spec.get("source"):
+        raise SpecError("the outline has no 'source:' line; a map says where its list came from")
+    groups = spec.get("groups") or []
+    if not groups:
+        raise SpecError("the outline has no '## group'")
+    seen = {}
+    for gi, g in enumerate(groups):
+        g.setdefault("planned", False)
+        if not g.get("items"):
+            raise SpecError(f"group {g.get('name')!r} has no items")
+        for it in g["items"]:
+            if isinstance(it, str):
+                it = {"text": it}
+            label = ((it.get("head") or "") + " " + it.get("text", "")).strip().lower()
+            if label in seen:
+                raise SpecError(f"{label!r} appears twice, under {seen[label]!r} and {g['name']!r}")
+            seen[label] = g["name"]
+        g["items"] = [({"text": i} if isinstance(i, str) else i) for i in g["items"]]
+        g.setdefault("color", PLANNED if g["planned"] else PALETTE[gi % len(PALETTE)])
+    spec.setdefault("subtitle", "")
+    spec.setdefault("center", spec["title"])
+    spec.setdefault("center_sub", "")
+    spec.setdefault("date", "")
+    spec.setdefault("planned_label", "not done yet")
+    lede = spec.get("lede") or []
+    spec["lede"] = textwrap.wrap(" ".join(lede), 52) if isinstance(lede, list) else textwrap.wrap(lede, 52)
+    return spec
+
+
+# --- layout ------------------------------------------------------------------
+
+def wrap(text, width=PILL_WRAP):
+    return textwrap.wrap(text, width) or [text or " "]
+
+
+def pill_size(item):
+    lines = wrap(item["text"]) if item.get("text") else []
+    head = item.get("head")
+    width = max([len(line) * CHAR_W for line in lines] + [len(head) * HEAD_CHAR_W if head else 0]) + 34
+    height = (LINE_H if head else 0) + len(lines) * LINE_H + PILL_PAD
+    return width, height
+
+
+def layout(spec):
+    """Place every group and pill. Returns geometry only; drawing is separate,
+    so the tests can check that nothing overlaps without rendering anything."""
+    groups = spec["groups"]
+    planned = [g for g in groups if g["planned"]]
+    shipped = [g for g in groups if not g["planned"]]
+    bottom = planned[:1]
+    sides = shipped + planned[1:]
+    half = math.ceil(len(sides) / 2)
+    left, right = sides[:half], sides[half:]
+
+    def stack_height(g):
+        return sum(pill_size(i)[1] for i in g["items"]) + PILL_GAP * (len(g["items"]) - 1)
+
+    heights = [sum(stack_height(g) for g in col) + GROUP_GAP * (len(col) - 1) for col in (left, right)]
+    rows = math.ceil(len(bottom[0]["items"]) / 3) if bottom else 0
+    body = max(heights + [360])
+    height = int(TOP + body + (140 + rows * 78 + 60 if bottom else 60) + 80)
+    widest = max([pill_size(i)[0] for g in groups for i in g["items"]] + [200])
+    width = int(max(1800, 2 * (RX + PILL_OFFSET + widest + 60)))
+    cx, cy = width / 2, TOP + body / 2
+
+    placed, pills = [], []
+    for side, col, total in ((-1, left, heights[0]), (1, right, heights[1])):
+        y = cy - total / 2
+        for g in col:
+            st = stack_height(g)
+            gx, gy = cx + side * RX, y + st / 2
+            placed.append({"group": g, "x": gx, "y": gy, "side": side})
+            yy = y
+            px = cx + side * (RX + PILL_OFFSET)
+            for it in g["items"]:
+                w, h = pill_size(it)
+                x = px if side > 0 else px - w
+                pills.append({"item": it, "group": g, "x": x, "y": yy, "w": w, "h": h, "side": side, "gx": gx, "gy": gy})
+                yy += h + PILL_GAP
+            y += st + GROUP_GAP
+    for g in bottom:
+        gx, gy = cx, TOP + body + 70
+        placed.append({"group": g, "x": gx, "y": gy, "side": 0})
+        k = len(g["items"])
+        for idx, it in enumerate(g["items"]):
+            r, c = divmod(idx, 3)
+            cnt = min(3, k - r * 3)
+            w, h = pill_size(it)
+            px = gx + (c - (cnt - 1) / 2) * 300
+            py = gy + 100 + r * 78
+            pills.append({"item": it, "group": g, "x": px - w / 2, "y": py - h / 2, "w": w, "h": h, "side": 0, "gx": gx, "gy": gy})
+    return {"width": width, "height": height, "cx": cx, "cy": cy, "groups": placed, "pills": pills}
+
+
+# --- drawing -----------------------------------------------------------------
+
+FONTS = "https://fonts.googleapis.com/css2?family=Fraunces:wght@400;600;700&family=Inter:wght@400;500;700&display=swap"
+
+STYLE = """
+.tt{font:600 58px 'Fraunces',Georgia,serif;fill:#1f2a37}
+.st{font:400 26px 'Fraunces',Georgia,serif;fill:#1f2a37}
+.lede{font:400 19px 'Inter',system-ui,sans-serif;fill:#4b5563}
+.ph{font:700 15px 'Inter',system-ui,sans-serif}
+.pt{font:500 14.5px 'Inter',system-ui,sans-serif;fill:#1f2937}
+.gt{font:700 20px 'Inter',system-ui,sans-serif}
+.ct{font:700 22px 'Fraunces',Georgia,serif;fill:#fff}
+.cs{font:500 12px 'Inter',system-ui,sans-serif;fill:#cbd5e1}
+.ft{font:500 13px 'Inter',system-ui,sans-serif;fill:#6b7280;letter-spacing:.14em}
+.lg{font:500 14px 'Inter',system-ui,sans-serif;fill:#374151}
+"""
+
+
+def esc(text):
+    return html.escape(str(text), quote=True)
+
+
+def dash(on, pattern):
+    return f' stroke-dasharray="{pattern}"' if on else ""
+
+
+def svg(spec):
+    geo = layout(spec)
+    W, H, cx, cy = geo["width"], geo["height"], geo["cx"], geo["cy"]
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" role="img">',
+           f"<title>{esc(spec['title'])} feature map</title>", f"<style>{STYLE}</style>",
+           f'<rect width="{W}" height="{H}" fill="#f7f5ef"/>',
+           f'<text x="60" y="92" class="tt">{esc(spec["title"])}</text>',
+           f'<text x="62" y="130" class="st">{esc(spec["subtitle"])}</text>']
+    out += [f'<text x="62" y="{172 + i * 26}" class="lede">{esc(line)}</text>' for i, line in enumerate(spec["lede"])]
+    out.append(f'<g transform="translate({W - 330},60)">'
+               '<rect width="16" height="16" rx="8" fill="#6b7280"/><text x="26" y="13" class="lg">shipped and in use</text>'
+               f'<rect y="30" width="16" height="16" rx="8" fill="#fff" stroke="{PLANNED}" stroke-width="1.6" stroke-dasharray="4 3"/>'
+               f'<text x="26" y="43" class="lg">{esc(spec["planned_label"])}</text></g>')
+    for g in geo["groups"]:
+        col, neg = g["group"]["color"], g["group"]["planned"]
+        mx = (cx + g["x"]) / 2 + (g["y"] - cy) * 0.15
+        my = (cy + g["y"]) / 2 - (g["x"] - cx) * 0.15
+        out.append(f'<path d="M{cx:.1f},{cy:.1f} Q{mx:.1f},{my:.1f} {g["x"]:.1f},{g["y"]:.1f}" stroke="{col}" '
+                   f'stroke-width="{4 if neg else 7}" fill="none" stroke-linecap="round" opacity=".85"{dash(neg, "10 8")}/>')
+    for p in geo["pills"]:
+        col = p["group"]["color"]
+        neg = p["group"]["planned"] or p["item"].get("planned")
+        side = p["side"]
+        if side:
+            ex, ey = p["gx"] + side * 95, p["gy"]
+            px, py = (p["x"] if side > 0 else p["x"] + p["w"]), p["y"] + p["h"] / 2
+            mid = (ex + px) / 2
+            d = f"M{ex:.1f},{ey:.1f} C{mid:.1f},{ey:.1f} {mid:.1f},{py:.1f} {px:.1f},{py:.1f}"
+        else:
+            ex, ey = p["gx"], p["gy"] + 24
+            px, py = p["x"] + p["w"] / 2, p["y"]
+            d = f"M{ex:.1f},{ey:.1f} C{ex:.1f},{(ey + py) / 2:.1f} {px:.1f},{(ey + py) / 2:.1f} {px:.1f},{py:.1f}"
+        out.append(f'<path d="{d}" stroke="{PLANNED if neg else col}" stroke-width="2.2" fill="none" opacity=".7"{dash(neg, "6 5")}/>')
+    for p in geo["pills"]:
+        col = PLANNED if (p["group"]["planned"] or p["item"].get("planned")) else p["group"]["color"]
+        neg = col == PLANNED
+        r = p["h"] / 2 if p["h"] < 50 else 18
+        out.append(f'<rect x="{p["x"]:.1f}" y="{p["y"]:.1f}" width="{p["w"]:.1f}" height="{p["h"]:.1f}" rx="{r:.1f}" '
+                   f'fill="#fff" stroke="{col}" stroke-width="1.6"{dash(neg, "5 4")}/>')
+        out.append(f'<rect x="{p["x"]:.1f}" y="{p["y"]:.1f}" width="{p["w"]:.1f}" height="{p["h"]:.1f}" rx="{r:.1f}" fill="{col}" fill-opacity=".13"/>')
+        ty, mx = p["y"] + 22, p["x"] + p["w"] / 2
+        if p["item"].get("head"):
+            out.append(f'<text x="{mx:.1f}" y="{ty:.1f}" text-anchor="middle" class="ph" fill="{col}">{esc(p["item"]["head"])}</text>')
+            ty += LINE_H
+        if p["item"].get("text"):
+            for line in wrap(p["item"]["text"]):
+                out.append(f'<text x="{mx:.1f}" y="{ty:.1f}" text-anchor="middle" class="pt">{esc(line)}</text>')
+                ty += LINE_H
+    for g in geo["groups"]:
+        col, neg = g["group"]["color"], g["group"]["planned"]
+        lines = wrap(g["group"]["name"], 16)
+        w, h = max(len(line) for line in lines) * 10.5 + 48, len(lines) * 24 + 34
+        out.append(f'<rect x="{g["x"] - w / 2:.1f}" y="{g["y"] - h / 2:.1f}" width="{w:.1f}" height="{h:.1f}" rx="{h / 2:.1f}" '
+                   f'fill="{"#fff" if neg else col}" stroke="{col}" stroke-width="3"{dash(neg, "8 6")}/>')
+        for i, line in enumerate(lines):
+            out.append(f'<text x="{g["x"]:.1f}" y="{g["y"] - h / 2 + 30 + i * 24:.1f}" text-anchor="middle" class="gt" '
+                       f'fill="{col if neg else "#fff"}">{esc(line)}</text>')
+    r = 100
+    hexagon = " ".join(f"{cx + r * math.cos(math.radians(60 * i - 30)):.1f},{cy + r * math.sin(math.radians(60 * i - 30)):.1f}" for i in range(6))
+    out.append(f'<polygon points="{hexagon}" fill="#1f2a37"/>')
+    out.append(f'<text x="{cx:.1f}" y="{cy - 2:.1f}" text-anchor="middle" class="ct">{esc(spec["center"])}</text>')
+    for i, line in enumerate(s for s in spec["center_sub"].split(" · ") if s):
+        out.append(f'<text x="{cx:.1f}" y="{cy + 24 + i * 16:.1f}" text-anchor="middle" class="cs">{esc(line)}</text>')
+    footer = "DRAWN FROM " + spec["source"] + (f"  ·  {spec['date']}" if spec["date"] else "")
+    out.append(f'<text x="{W / 2:.1f}" y="{H - 28}" text-anchor="middle" class="ft">{esc(footer.upper())}</text>')
+    out.append("</svg>")
+    return "\n".join(out) + "\n"
+
+
+def page(spec):
+    return (f'<!doctype html><html><head><meta charset="utf-8"><title>{esc(spec["title"])} feature map</title>'
+            f'<link rel="stylesheet" href="{FONTS}"></head><body style="margin:0;background:#f7f5ef">{svg(spec)}</body></html>\n')
+
+
+def mermaid(spec):
+    """The same map as a Mermaid tree, for a Markdown page that renders it."""
+    def q(text):
+        return text.replace('"', "'").replace("[", "(").replace("]", ")")
+    out = ["flowchart LR", f'  R(["{q(spec["title"])}"])']
+    n = 0
+    for gi, g in enumerate(spec["groups"], 1):
+        out.append(f'  R --> G{gi}["{q(g["name"])}"]')
+        out.append(f"  class G{gi} {'nogrp' if g['planned'] else 'grp'}")
+        for it in g["items"]:
+            n += 1
+            label = (f"{it['head']}: " if it.get("head") else "") + it.get("text", "")
+            out.append(f'  G{gi} --- N{n}["{q(label)}"]')
+            if g["planned"] or it.get("planned"):
+                out.append(f"  class N{n} no")
+    out += ["  classDef grp font-weight:bold",
+            f"  classDef nogrp font-weight:bold,fill:#fbe3e3,stroke:{PLANNED}",
+            f"  classDef no fill:#fdf0f0,stroke:{PLANNED},stroke-dasharray:4 3"]
+    return "\n".join(out) + "\n"
+
+
+# --- png ---------------------------------------------------------------------
+
+def browser():
+    found = os.environ.get("FEATURE_MAP_BROWSER")
+    for name in ([found] if found else []) + ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"]:
+        path = shutil.which(name) if name else None
+        if path:
+            return path
+    return None
+
+
+def png(spec, out):
+    exe = browser()
+    if not exe:
+        raise RuntimeError("png needs a Chromium-based browser on PATH, or FEATURE_MAP_BROWSER set")
+    geo = layout(spec)
+    out = Path(out).resolve()
+    # Written beside the output, not in /tmp: a sandboxed browser may not see /tmp.
+    with tempfile.TemporaryDirectory(dir=out.parent, prefix=".feature-map-") as tmp:
+        src = Path(tmp) / "map.html"
+        src.write_text(page(spec), encoding="utf-8")
+        cmd = [exe, "--headless=new", "--disable-gpu", "--hide-scrollbars", "--virtual-time-budget=8000",
+               f"--window-size={geo['width']},{geo['height']}", f"--screenshot={out}", src.as_uri()]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
+    if result.returncode != 0 or not out.exists():
+        raise RuntimeError(f"the browser did not write {out.name}: {result.stderr.strip()[-300:]}")
+
+
+# --- command line ------------------------------------------------------------
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="feature-map", description="Draw what a tool does as one picture.")
+    ap.add_argument("--version", action="version", version=f"feature-map {VERSION}")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("render", help="draw the map")
+    r.add_argument("spec")
+    r.add_argument("-o", "--output")
+    r.add_argument("--format", choices=["svg", "html", "png", "mermaid"])
+    c = sub.add_parser("check", help="validate the outline")
+    c.add_argument("spec")
+    args = ap.parse_args(argv)
+    try:
+        spec = load(args.spec)
+    except (SpecError, json.JSONDecodeError) as exc:
+        print(f"feature-map: {args.spec}: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"feature-map: {exc}", file=sys.stderr)
+        return 2
+    if args.cmd == "check":
+        items = sum(len(g["items"]) for g in spec["groups"])
+        planned = sum(1 for g in spec["groups"] for i in g["items"] if g["planned"] or i.get("planned"))
+        print(f"{spec['title']}: {len(spec['groups'])} groups, {items} items, {planned} not done yet; drawn from {spec['source']}")
+        return 0
+    fmt = args.format or (Path(args.output).suffix.lstrip(".") if args.output else "svg")
+    if fmt not in ("svg", "html", "png", "mermaid", "mmd"):
+        print(f"feature-map: cannot tell the format from {args.output!r}; pass --format", file=sys.stderr)
+        return 2
+    if fmt == "png":
+        if not args.output:
+            print("feature-map: png needs -o FILE", file=sys.stderr)
+            return 2
+        try:
+            png(spec, args.output)
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            print(f"feature-map: {exc}", file=sys.stderr)
+            return 3
+        return 0
+    text = {"svg": svg, "html": page, "mermaid": mermaid, "mmd": mermaid}[fmt](spec)
+    if args.output:
+        Path(args.output).write_text(text, encoding="utf-8")
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
