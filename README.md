@@ -2,15 +2,15 @@
 
 **Draw what a tool does as one picture, from a plain outline.**
 
-A tool that keeps growing gets hard to hold in your head. Its README lists every flag, and nobody reads a README to learn what the thing is for. A feature map is the other view: every capability grouped by the job it does, around the tool's name, with the work that is not done yet drawn in dashes beside the rest.
+A tool that keeps growing gets hard to hold in your head. Its README lists every flag, and nobody reads a README to learn what it's for. A feature map is the other view: every capability grouped by the job it does, around the tool's name, with the work that is not done yet drawn in dashes beside the rest.
 
 ![A feature map for an invented notes app, with four coloured branches and a dashed branch of planned work](docs/example.png)
 
-**It refuses to draw a map that cannot be checked.** Every outline says where its list came from, and that source is printed on the map. A map with no source, or one that names the same feature twice, is an error instead of a picture.
+**It refuses to draw a map that cannot be checked.** Every outline says where its list came from, and that source is printed on the map. A map with no source, or one that names the same feature twice, isn't drawn: you get an error instead.
 
 ## Try it
 
-It needs Python 3 and nothing else. Drawing a PNG also needs a Chromium-based browser.
+You'll need Python 3 and nothing else. Drawing a PNG also needs a Chromium-based browser.
 
 ```bash
 make example
@@ -73,8 +73,8 @@ prints what the outline holds, and exits 1 if it would be refused.
 
 ## What it does not do
 
-- **It does not read your code.** The outline is written by a person, or by a tool that knows the feature list. The map is as true as the outline, which is why it prints its source.
-- **The layout is automatic and fixed in style**: groups to the left and right of the centre, the first planned group below it. There is no theme option yet.
+- **It doesn't read your code.** The outline is written by a person, or by a tool that knows the feature list. The map is as true as the outline, which is why it prints its source.
+- **The layout is automatic and fixed in style**: groups to the left and right of the centre, the first planned group below it. There's no theme option yet.
 - **Text widths are estimated**, so a pill can come out a little wide. Pills never overlap, and the tests check that on a crowded map.
 
 ## Licence

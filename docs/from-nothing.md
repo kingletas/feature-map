@@ -23,7 +23,7 @@ It exists because a tool that keeps growing outgrows its README. The README says
 git clone https://github.com/kingletas/feature-map && cd feature-map && make install
 ```
 
-That puts `feature-map` in `~/bin`. Set `PREFIX` to install somewhere else: `make install PREFIX=/usr/local/bin`.
+You now have `feature-map` in `~/bin`. If you'd rather have it somewhere else, set `PREFIX`: `make install PREFIX=/usr/local/bin`.
 
 ## Step 2: write an outline
 
