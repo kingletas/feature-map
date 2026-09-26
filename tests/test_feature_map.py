@@ -111,6 +111,14 @@ class Layout(unittest.TestCase):
             self.assertLessEqual(p["x"] + p["w"], geo["width"])
 
 
+    def test_columns_are_balanced_by_height_not_count(self):
+        tall = "".join(f"- **t{i}**: item\n" for i in range(9))
+        s = spec_from("# Lean\nsource: a test\n## Tall\n" + tall + "## A\n- a\n## B\n- b\n## C\n- c\n")
+        sides = {g["group"]["name"]: g["side"] for g in fm.layout(s)["groups"]}
+        self.assertEqual(sides["Tall"], -1)
+        self.assertEqual({sides["A"], sides["B"], sides["C"]}, {1}, "the three short groups share the other side")
+
+
 class Drawing(unittest.TestCase):
     def test_svg_escapes_what_it_draws(self):
         s = spec_from(OUTLINE.replace("open a file", "open <b>&</b> a file"))

@@ -165,13 +165,19 @@ def layout(spec):
     shipped = [g for g in groups if not g["planned"]]
     bottom = planned[:1]
     sides = shipped + planned[1:]
-    half = math.ceil(len(sides) / 2)
-    left, right = sides[:half], sides[half:]
-
     def stack_height(g):
         return sum(pill_size(i)[1] for i in g["items"]) + PILL_GAP * (len(g["items"]) - 1)
 
-    heights = [sum(stack_height(g) for g in col) + GROUP_GAP * (len(col) - 1) for col in (left, right)]
+    def column_height(col):
+        return sum(stack_height(g) for g in col) + GROUP_GAP * max(len(col) - 1, 0)
+
+    # Split the groups, in order, where the two columns come out closest in
+    # height, so a map with one crowded group does not lean to one side.
+    half = min(range(len(sides) + 1),
+               key=lambda k: (max(column_height(sides[:k]), column_height(sides[k:])), abs(2 * k - len(sides))))
+    left, right = sides[:half], sides[half:]
+
+    heights = [column_height(left), column_height(right)]
     rows = math.ceil(len(bottom[0]["items"]) / 3) if bottom else 0
     body = max(heights + [360])
     height = int(TOP + body + (140 + rows * 78 + 60 if bottom else 60) + 80)
